@@ -32,6 +32,7 @@ const initialDb = {
   refunds: [],
   releases: [],
   reviews: [],
+  order_declines: [],
   ad_attributions: [],
   conversions: []
 };
@@ -259,6 +260,11 @@ function discovery() {
       { method: "POST", path: "/releases", summary: "Record/reconcile escrow release after buyer runs chain release. Body {order_id,escrow_id,proof}." },
       { method: "GET", path: "/releases", summary: "Browse release records and chain release status." },
       { method: "POST", path: "/reviews", summary: "Review a delivered sample/order. Body {order_id,rating,message,would_pay_again}." },
+      { method: "GET", path: "/reviews", summary: "Browse paid/released reputation without private memoir details. Filters: ?status=verified_paid_review&writer_addr=...&buyer_addr=..." },
+      { method: "GET", path: "/writers/:addr/reputation", summary: "Wallet-bound writer reputation from verified paid reviews, accepted deliveries, and released escrow." },
+      { method: "GET", path: "/writer-dashboard", summary: "Signed writer queue split into paid work, awaiting release/review, and unfunded escrow bait." },
+      { method: "POST", path: "/order-declines", summary: "Verified writer declines an unfunded or bogus order until real escrow is attached. Body {order_id,reason}." },
+      { method: "GET", path: "/order-declines", summary: "Browse declined escrow-bait orders; private reasons are protected." },
       { method: "GET", path: "/ad-attributions", summary: "Verified funded-order ad conversions ready for advertiser-signed ag3ntads attestation." },
       { method: "GET", path: "/activity", summary: "Recent signed usage, feedback, orders, and product learning signals." },
       { method: "POST", path: "/feedback", summary: "Report praise, complaint, bug, or feature request. Body {sentiment,type,endpoint_context,message}." }
@@ -295,6 +301,7 @@ function publicActivity(db, actor = {}) {
       refunds: db.refunds.length,
       releases: db.releases.length,
       reviews: db.reviews.length,
+      order_declines: db.order_declines.length,
       ad_attributions: db.ad_attributions.length,
       signed_orders: db.orders.filter((o) => o.actor.signed).length,
       funded_orders: db.orders.filter((order) => orderTrustState(db, order).verified_escrow).length
@@ -597,6 +604,16 @@ function releasedEscrowForOrder(db, order) {
   return release || null;
 }
 
+function latestWriterDeclineForOrder(db, order) {
+  if (!order) return null;
+  return db.order_declines.slice().reverse().find((decline) =>
+    decline.order_id === order.id &&
+    decline.actor?.signed &&
+    actorIsWriter(order, decline.actor) &&
+    decline.status === "declined_pending_verified_escrow"
+  ) || null;
+}
+
 function orderTrustState(db, order) {
   const verified_escrow = verifiedEscrowForOrder(db, order);
   const latest_writer_delivery = verifiedWriterDeliveryForOrder(db, order);
@@ -614,6 +631,7 @@ function orderTrustState(db, order) {
     latest_substantive_writer_delivery: latest_substantive_writer_delivery || null,
     delivery_quality_evidence: quality_evidence,
     latest_revision_request: latest_revision_request || null,
+    latest_writer_decline: latestWriterDeclineForOrder(db, order),
     accepted_delivery: accepted_delivery || null,
     reputation_eligible_acceptance: reputation_eligible_acceptance || null,
     released_escrow: released_escrow || null,
@@ -638,6 +656,9 @@ function orderOperationalState(db, order) {
   if (!order?.actor?.signed) {
     state.state = "unsigned_draft";
     state.next_actions.push("buyer_sign_order");
+  } else if (latestWriterDeclineForOrder(db, order) && !trust.verified_escrow) {
+    state.state = "declined_pending_verified_escrow";
+    state.next_actions.push("buyer_attach_real_chain_escrow_to_reopen_writer_queue");
   } else if (!trust.verified_escrow) {
     state.state = "awaiting_verified_escrow";
     state.next_actions.push("buyer_attach_numeric_chain_escrow");
@@ -739,6 +760,20 @@ function reconcileOrderTrust(db) {
     review.status = paid ? "verified_paid_review" : "unverified_review";
     if (order && actorIsBuyer(order, review.actor) && releasedEscrowForOrder(db, order) && !reputationReady) {
       review.status = "paid_review_needs_memoir_quality_evidence";
+    }
+  }
+
+  for (const decline of db.order_declines) {
+    const order = db.orders.find((candidate) => candidate.id === decline.order_id);
+    if (!order || !actorIsWriter(order, decline.actor)) {
+      decline.status = "invalid_unverified_writer_or_order";
+    } else if (verifiedEscrowForOrder(db, order)) {
+      decline.status = "superseded_by_verified_escrow";
+    } else {
+      decline.status = "declined_pending_verified_escrow";
+      if (!["funded", "accepted_pending_release", "released_paid"].includes(order.status)) {
+        order.status = "declined_pending_verified_escrow";
+      }
     }
   }
 
@@ -972,6 +1007,7 @@ function publicTrustState(db, order, actor) {
     latest_substantive_writer_delivery: trust.latest_substantive_writer_delivery ? publicDelivery(db, trust.latest_substantive_writer_delivery, order, actor) : null,
     delivery_quality_evidence: trust.delivery_quality_evidence,
     latest_revision_request: trust.latest_revision_request,
+    latest_writer_decline: trust.latest_writer_decline ? publicOrderArtifact(db, trust.latest_writer_decline, actor) : null,
     accepted_delivery: trust.accepted_delivery ? publicOrderArtifact(db, trust.accepted_delivery, actor) : null,
     reputation_eligible_acceptance: trust.reputation_eligible_acceptance ? publicOrderArtifact(db, trust.reputation_eligible_acceptance, actor) : null,
     released_escrow: trust.released_escrow ? publicOrderArtifact(db, trust.released_escrow, actor) : null,
@@ -979,6 +1015,87 @@ function publicTrustState(db, order, actor) {
     rights_state: trust.rights_state,
     writer_reputation_state: trust.writer_reputation_state,
     operational_state: orderOperationalState(db, order)
+  };
+}
+
+function publicReview(db, review, actor) {
+  const order = db.orders.find((candidate) => candidate.id === review.order_id);
+  const trust = order ? orderTrustState(db, order) : null;
+  const canViewFull = order && actorCanViewOrderPrivate(order, actor);
+  const delivery = trust?.reputation_eligible_acceptance
+    ? verifiedWriterDeliveryForOrder(db, order, trust.reputation_eligible_acceptance.delivery_id)
+    : null;
+  const safe = publicOrderArtifact(db, review, actor);
+  if (!canViewFull) {
+    safe.message = review.status === "verified_paid_review"
+      ? "Verified paid memoir review recorded. Wording is withheld from public listing to protect private memoir material."
+      : "Unverified review recorded. Wording is withheld from public listing.";
+  }
+  return {
+    ...safe,
+    order_id: review.order_id,
+    buyer_addr: order?.actor?.address || review.actor?.address || null,
+    writer_addr: order?.payee_addr || null,
+    delivery_id: trust?.reputation_eligible_acceptance?.delivery_id || review.raw?.delivery_id || null,
+    verified_paid: review.status === "verified_paid_review",
+    released_escrow_id: trust?.released_escrow?.escrow_id || null,
+    paid_amount: order?.amount || null,
+    craft_evidence: delivery ? {
+      scene_objective_present: Boolean(delivery.scene_objective),
+      interview_questions_present: Boolean(delivery.interview_questions),
+      outline_beats_present: Boolean(delivery.outline_beats),
+      substantial_draft_present: deliveryQualityEvidence(delivery).has_substantial_draft,
+      rights_terms_present: Boolean(delivery.rights_transfer),
+      status: deliveryQualityEvidence(delivery).status
+    } : review.quality_evidence || null,
+    private_material_policy: "No draft, private notes, family dialogue, or identifying business details are shown in public review views."
+  };
+}
+
+function writerReputation(db, writerAddr, actor = {}) {
+  const orders = db.orders.filter((order) => isSameAddress(order.payee_addr, writerAddr));
+  const verifiedReviews = db.reviews
+    .filter((review) => review.status === "verified_paid_review")
+    .filter((review) => {
+      const order = db.orders.find((candidate) => candidate.id === review.order_id);
+      return order && isSameAddress(order.payee_addr, writerAddr);
+    });
+  const releasedPaidOrders = orders.filter((order) => orderTrustState(db, order).payment_state === "released_paid");
+  const acceptedDeliveries = orders.filter((order) => Boolean(orderTrustState(db, order).accepted_delivery));
+  const writerEarnings = releasedPaidOrders.reduce((sum, order) => sum + (Number(order.amount) || 0), 0);
+  return {
+    writer_addr: writerAddr,
+    verified_paid_reviews: verifiedReviews.length,
+    accepted_deliveries: acceptedDeliveries.length,
+    released_paid_orders: releasedPaidOrders.length,
+    writer_earnings: writerEarnings,
+    repeat_buyer_intent: verifiedReviews.filter((review) => review.would_pay_again === true).length,
+    reviews: verifiedReviews.map((review) => publicReview(db, review, actor)),
+    proof_policy: "Reputation counts only buyer reviews after verified escrow, accepted memoir-quality delivery, and released escrow."
+  };
+}
+
+function writerDashboard(db, actor, writerAddr = null) {
+  const addr = writerAddr || actor.address;
+  const canUseSignedQueue = actor.signed && (!writerAddr || isSameAddress(actor.address, writerAddr));
+  const orders = addr
+    ? db.orders.filter((order) => isSameAddress(order.payee_addr, addr))
+    : [];
+  const paidWork = orders.filter((order) => verifiedEscrowForOrder(db, order) && !releasedEscrowForOrder(db, order));
+  const paidHistory = orders.filter((order) => releasedEscrowForOrder(db, order));
+  const escrowBait = orders.filter((order) => !verifiedEscrowForOrder(db, order));
+  return {
+    writer_addr: canUseSignedQueue ? addr : addr || "sign_request_or_pass_writer_addr",
+    signed_private_queue: canUseSignedQueue,
+    paid_work_queue: paidWork.map((order) => publicOrderSummary(db, order, actor)),
+    paid_history: paidHistory.map((order) => publicOrderSummary(db, order, actor)),
+    unfunded_or_unverified_orders: escrowBait.map((order) => publicOrderSummary(db, order, actor)),
+    verified_reviews: addr ? writerReputation(db, addr, actor).reviews : [],
+    next_actions: {
+      safe_delivery: "Deliver only orders in paid_work_queue with verified escrow.",
+      decline_bait: "POST /order-declines with {order_id, reason} for unfunded or bogus escrow orders.",
+      reputation: addr ? `/writers/${addr}/reputation` : "Sign as writer to view wallet reputation."
+    }
   };
 }
 
@@ -1112,6 +1229,15 @@ async function handle(req, res) {
         funded: fundedOnly
       },
       ui: ui("Orders", "Use ?role=writer&funded=true for a safe paid work queue, or ?status=awaiting_writer_delivery for funded delivery work.")
+    });
+  }
+
+  if (req.method === "GET" && url.pathname === "/writer-dashboard") {
+    const writerAddr = url.searchParams.get("writer_addr");
+    writeDb(db);
+    return send(res, 200, {
+      dashboard: writerDashboard(db, actor, writerAddr),
+      ui: ui("Writer dashboard", "Paid work is separated from unfunded or unverified escrow bait.")
     });
   }
 
@@ -1890,11 +2016,92 @@ async function handle(req, res) {
     return send(res, 200, { releases: db.releases.map((item) => publicOrderArtifact(db, item, actor)), ui: ui("Releases", "Release records tie paid reputation to chain release status.") });
   }
 
+  if (req.method === "POST" && url.pathname === "/order-declines") {
+    const order = db.orders.find((candidate) => candidate.id === body.order_id);
+    const canDecline = order && actorIsWriter(order, actor) && !verifiedEscrowForOrder(db, order);
+    const item = {
+      id: id("decline"),
+      at: new Date().toISOString(),
+      actor,
+      order_id: body.order_id || null,
+      reason: body.reason || "",
+      raw: body,
+      status: canDecline ? "declined_pending_verified_escrow" : verifiedEscrowForOrder(db, order) ? "blocked_order_already_verified_funded" : "invalid_unverified_writer_or_order"
+    };
+    db.order_declines.push(item);
+    if (order && item.status === "declined_pending_verified_escrow") order.status = "declined_pending_verified_escrow";
+    writeDb(db);
+    return send(res, 201, {
+      ok: item.status === "declined_pending_verified_escrow",
+      decline: publicOrderArtifact(db, item, actor),
+      order: order ? publicOrderSummary(db, order, actor) : null,
+      ui: ui(
+        item.status === "declined_pending_verified_escrow" ? "Order declined until funded" : "Decline blocked",
+        item.status === "declined_pending_verified_escrow"
+          ? "The writer queue will treat this as escrow bait until the buyer attaches real verified chain escrow."
+          : "Only the signed payee writer can decline an unfunded or unverified order."
+      )
+    });
+  }
+
+  if (req.method === "GET" && url.pathname === "/order-declines") {
+    writeDb(db);
+    return send(res, 200, {
+      order_declines: db.order_declines.map((item) => publicOrderArtifact(db, item, actor)),
+      ui: ui("Order declines", "Declines protect writers from unfunded full-draft pressure and are superseded by real verified escrow.")
+    });
+  }
+
   if (req.method === "GET" && url.pathname === "/ad-attributions") {
     writeDb(db);
     return send(res, 200, {
       ad_attributions: db.ad_attributions,
       ui: ui("Ad attributions", "Only verified funded orders are ready for advertiser-signed ag3ntads conversion attestation.")
+    });
+  }
+
+  if (req.method === "GET" && url.pathname === "/reviews") {
+    let reviews = db.reviews.slice();
+    const statusFilter = url.searchParams.get("status");
+    const writerFilter = url.searchParams.get("writer_addr");
+    const buyerFilter = url.searchParams.get("buyer_addr");
+    if (statusFilter) reviews = reviews.filter((review) => review.status === statusFilter);
+    if (writerFilter) reviews = reviews.filter((review) => {
+      const order = db.orders.find((candidate) => candidate.id === review.order_id);
+      return order && isSameAddress(order.payee_addr, writerFilter);
+    });
+    if (buyerFilter) reviews = reviews.filter((review) => {
+      const order = db.orders.find((candidate) => candidate.id === review.order_id);
+      return order && isSameAddress(order.actor?.address, buyerFilter);
+    });
+    const publicReviews = reviews.map((review) => publicReview(db, review, actor));
+    writeDb(db);
+    return send(res, 200, {
+      reviews: publicReviews,
+      reputation_summary: {
+        total_reviews: publicReviews.length,
+        verified_paid_reviews: publicReviews.filter((review) => review.status === "verified_paid_review").length,
+        repeat_buyer_intent: publicReviews.filter((review) => review.status === "verified_paid_review" && review.would_pay_again === true).length
+      },
+      filters: {
+        status: statusFilter,
+        writer_addr: writerFilter,
+        buyer_addr: buyerFilter
+      },
+      ui: ui("Reviews", "Only verified paid reviews count toward reputation; public text is truncated and private memoir material is withheld.")
+    });
+  }
+
+  if (req.method === "GET" && url.pathname.startsWith("/writers/") && url.pathname.endsWith("/reputation")) {
+    const writerAddr = url.pathname.split("/")[2];
+    if (!AGNT_ADDR.test(writerAddr)) {
+      writeDb(db);
+      return send(res, 400, { error: "invalid_writer_addr", ui: ui("Invalid writer address", "Use /writers/{agnt...}/reputation.") });
+    }
+    writeDb(db);
+    return send(res, 200, {
+      reputation: writerReputation(db, writerAddr, actor),
+      ui: ui("Writer reputation", "This page counts paid craft evidence, not self-claimed profile text.")
     });
   }
 
