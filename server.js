@@ -429,7 +429,7 @@ function publisherAdGuidance(db) {
     ad_exchange: "ag3ntads",
     source_of_truth: "/ad-readiness",
     decision: {
-      memoir_ghostwriting_service: serviceReady ? "serve_contextual_test" : "hold",
+      memoir_ghostwriting_service: serviceReady ? "product_ready_verify_exchange_before_serving" : "hold",
       memoir_ebook_sales: readerReady ? "serve_contextual_test" : "suppress"
     },
     allowed_campaigns: serviceReady ? [
@@ -441,6 +441,7 @@ function publisherAdGuidance(db) {
           cta: "Post memoir brief",
           mvp_url: "http://localhost:4501/briefs"
         },
+        serving_gate: "Must pass /contextual-ad-serving-status with current_paid_serving=contextual_service_only before ag3ntbook requests or renders paid placements.",
         conversion_event: "verified_funded_order",
         conversion_attestation_source: "/ad-attributions",
         ag3ntads_readiness_payload: campaignReadiness.memoir_ghostwriting_service,
@@ -479,6 +480,7 @@ function publisherAdGuidance(db) {
       }
     },
     ag3ntads_campaign_readiness_payloads: campaignReadiness,
+    ag3ntads_publisher_serving_payloads: ag3ntadsPublisherServingPayloads(readiness),
     ag3ntads_feedback_request: {
       endpoint: "http://localhost:4001/feedback",
       message: "Ghostwriter Hub has service readiness for contextual memoir ghostwriting placements, but reader/ebook ads must stay suppressed until /ad-readiness reader_ads is ok_to_test. Campaign serving needs offer_type-specific readiness and publisher placement context."
@@ -531,6 +533,69 @@ function ag3ntadsCampaignReadinessPayloads(readiness) {
       decision: readerReady ? "ready_to_submit_to_ag3ntads" : "hold",
       missing: readiness.reader_ads.missing
     }
+  };
+}
+
+function ag3ntadsPublisherServingPayloads(readiness) {
+  const campaignReadiness = ag3ntadsCampaignReadinessPayloads(readiness);
+  return {
+    purpose: "Let ag3ntbook request in-context sponsored opportunities without treating Ghostwriter Hub as generic ad directory inventory.",
+    preconditions_before_opportunity_requests: [
+      "ag3ntads has an active Ghostwriter Hub memoir_ghostwriting_service campaign",
+      "that campaign readiness_status is ready",
+      "that campaign funding.deposit_covered is true",
+      "that campaign serving.eligible is true",
+      "the ag3ntbook placement context matches one of Ghostwriter Hub's service publisher contexts"
+    ],
+    do_not_request_when_any_true: [
+      "the only available Ghostwriter campaigns are pending_deposit",
+      "the placement is an ebook, reader, catalog, or general reading recommendation",
+      "the placement would need private memoir text, sample wording, or reader review wording",
+      "the campaign offer_type is memoir_ebook_sales while reader_ads.ready_to_test is false"
+    ],
+    publisher_registration: {
+      method: "POST",
+      endpoint: `${AG3NTADS_URL}/ads/publishers`,
+      body: {
+        name: "ag3ntbook contextual memoir discovery",
+        app_url: AG3NTBOOK_URL,
+        dispute_policy: "Serve Ghostwriter Hub only in public memoir/family-history/writing-help contexts; preserve private memoir text and suppress reader catalog ads until Ghostwriter reader_ads is green."
+      },
+      auth_note: "ag3ntbook should sign this request with its publisher wallet; bond_tx or escrow_id can be attached by the publisher if required."
+    },
+    placement_registration: {
+      method: "POST",
+      endpoint: `${AG3NTADS_URL}/ads/publishers/:publisher_addr/placements`,
+      body: {
+        placement_key: "ag3ntbook.memoir_context.service_inline.v1",
+        app_context: "feed_profile_reply",
+        description: "Inline sponsored service placement beside public posts, profiles, or replies about memoir writing, family history, paid briefs, escrow, or creator services.",
+        allowed_offer_types: ["memoir_ghostwriting_service"],
+        min_clicker_reputation: 0,
+        bond_required: false,
+        status: "active"
+      },
+      blocked_offer_types: readiness.reader_ads.ready_to_test ? [] : ["memoir_ebook_sales"]
+    },
+    opportunity_request_template: {
+      method: "POST",
+      endpoint: `${AG3NTADS_URL}/ads/opportunities`,
+      body: {
+        placement_key: "ag3ntbook.memoir_context.service_inline.v1",
+        context: {
+          type: "feed_post_or_profile_or_reply",
+          tags: ["memoir", "family-history", "writing-help", "paid-brief", "escrow", "creator-services"],
+          text: "Use only short public context text from ag3ntbook; do not include private memoir details or Ghostwriter sample/review wording.",
+          readiness_path: "http://localhost:4501/contextual-ad-serving-status",
+          allowed_offer_types: ["memoir_ghostwriting_service"],
+          suppressed_offer_types: readiness.reader_ads.ready_to_test ? [] : ["memoir_ebook_sales"]
+        },
+        limit: 1
+      },
+      may_request_now: false,
+      may_request_when: "Ghostwriter Hub /contextual-ad-serving-status decision.current_paid_serving is contextual_service_only."
+    },
+    campaign_readiness_payloads: campaignReadiness
   };
 }
 
@@ -608,6 +673,7 @@ function adCampaignPlan(db) {
         suppress_reader_ads_unless: "reader_ads.ready_to_test === true"
       }
     },
+    publisher_serving_payloads: ag3ntadsPublisherServingPayloads(readiness),
     ad_exchange_serving_gate: adExchangeHandoff(db).serving_gate,
     ag3ntads_campaign_readiness_payloads: campaignReadiness,
     feedback_payloads: [
@@ -693,6 +759,7 @@ function acquisitionLaunchPacket(db) {
     ad_exchange_serving_gate: handoff.serving_gate,
     service_readiness_payload: plan.ag3ntads_campaign_readiness_payloads.memoir_ghostwriting_service,
     publisher_context_rules: guidance.ag3ntbook_context_rules,
+    publisher_serving_payloads: guidance.ag3ntads_publisher_serving_payloads,
     conversion_policy: {
       service_event: "verified_funded_order",
       attest_from: "http://localhost:4501/ad-attributions",
@@ -783,6 +850,7 @@ function adExchangeHandoff(db) {
         }
       }
     ],
+    ag3ntads_publisher_serving_payloads: ag3ntadsPublisherServingPayloads(readiness),
     readiness
   };
 }
@@ -874,6 +942,7 @@ async function contextualAdServingStatus(db) {
   ).length;
   const serviceMayServe = eligibleServiceCampaigns.length > 0 && readiness.service_ads.ready_to_test;
   const readerMayServe = false;
+  const publisherServingPayloads = ag3ntadsPublisherServingPayloads(readiness);
   return {
     updated_at: new Date().toISOString(),
     decision: {
@@ -915,6 +984,11 @@ async function contextualAdServingStatus(db) {
         reason: "Ghostwriter service offer is product-ready, but ag3ntads has no active funded serving-eligible Ghostwriter campaign. Keep using organic memoir discovery and feedback until funding/eligibility clears.",
         still_suppress_reader_ads: true
       },
+    ag3ntads_publisher_opportunity_request: {
+      ...publisherServingPayloads.opportunity_request_template,
+      may_request_now: serviceMayServe,
+      current_gate: serviceMayServe ? "open_for_contextual_service_only" : "closed_until_active_funded_eligible_service_campaign"
+    },
     feedback_payloads_to_file: [
       {
         target: "ag3ntads",
