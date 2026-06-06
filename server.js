@@ -287,6 +287,7 @@ function discovery() {
       { method: "GET", path: "/ad-readiness", summary: "Advertiser and publisher readiness decision for service vs reader offers. Use before launching ag3ntads campaigns." },
       { method: "GET", path: "/ad-campaign-plan", summary: "Launch/no-launch ad plan derived from readiness and feedback. Includes contextual service placement guidance and reader-ad suppression feedback payloads." },
       { method: "GET", path: "/acquisition-launch-packet", summary: "Operator checklist for the next ag3ntads/ag3ntbook acquisition action. Includes campaign draft, readiness payload, publisher context rules, and blocked reader-ad feedback." },
+      { method: "GET", path: "/ad-exchange-handoff", summary: "ag3ntads/ag3ntbook serving handoff that separates product readiness from exchange funding, campaign eligibility, and publisher context matching." },
       { method: "GET", path: "/publisher-ad-guidance", summary: "Contextual publisher guidance for ag3ntbook/ag3ntads: which memoir offers can be served, where, and what must stay blocked." },
       { method: "GET", path: "/ad-attributions", summary: "Verified funded-order ad conversions ready for advertiser-signed ag3ntads attestation." },
       { method: "GET", path: "/activity", summary: "Recent signed usage, feedback, orders, and product learning signals." },
@@ -604,6 +605,7 @@ function adCampaignPlan(db) {
         suppress_reader_ads_unless: "reader_ads.ready_to_test === true"
       }
     },
+    ad_exchange_serving_gate: adExchangeHandoff(db).serving_gate,
     ag3ntads_campaign_readiness_payloads: campaignReadiness,
     feedback_payloads: [
       {
@@ -638,6 +640,7 @@ function adCampaignPlan(db) {
 function acquisitionLaunchPacket(db) {
   const plan = adCampaignPlan(db);
   const guidance = publisherAdGuidance(db);
+  const handoff = adExchangeHandoff(db);
   const serviceTest = plan.launchable_tests.find((test) => test.offer_type === "memoir_ghostwriting_service") || null;
   const readerBlock = plan.blocked_tests.find((test) => test.offer_type === "memoir_ebook_sales") || null;
   const serviceCreativeText = serviceTest
@@ -671,8 +674,9 @@ function acquisitionLaunchPacket(db) {
     },
     operator_next_actions: [
       ...(serviceCampaignDraft ? [
-        "Create one memoir_ghostwriting_service ag3ntads campaign from service_campaign_draft.",
+        "Check ag3ntads for an existing Ghostwriter Hub memoir_ghostwriting_service campaign before creating a duplicate.",
         "Attach ag3ntads_readiness_payloads.memoir_ghostwriting_service to the campaign readiness endpoint.",
+        "Do not ask publishers to serve until ag3ntads reports campaign funding.deposit_covered=true and serving.eligible=true.",
         "Ask ag3ntbook to request opportunities only in relevant memoir, family-history, writing-help, paid-brief, escrow, or creator-service contexts."
       ] : [
         "Do not create a campaign until service_ads.ready_to_test is true."
@@ -682,6 +686,8 @@ function acquisitionLaunchPacket(db) {
       ] : [])
     ],
     service_campaign_draft: serviceCampaignDraft,
+    existing_campaign_follow_up: handoff.existing_campaign_follow_up,
+    ad_exchange_serving_gate: handoff.serving_gate,
     service_readiness_payload: plan.ag3ntads_campaign_readiness_payloads.memoir_ghostwriting_service,
     publisher_context_rules: guidance.ag3ntbook_context_rules,
     conversion_policy: {
@@ -694,6 +700,86 @@ function acquisitionLaunchPacket(db) {
     blocked_reader_campaign: readerBlock || null,
     feedback_payloads_to_file: plan.feedback_payloads,
     readiness_snapshot: plan.readiness
+  };
+}
+
+function adExchangeHandoff(db) {
+  const readiness = adReadiness(db);
+  const campaignReadiness = ag3ntadsCampaignReadinessPayloads(readiness);
+  const serviceProductReady = readiness.service_ads.ready_to_test;
+  const readerProductReady = readiness.reader_ads.ready_to_test;
+  return {
+    updated_at: new Date().toISOString(),
+    purpose: "Give ag3ntads and ag3ntbook the publisher-serving facts without treating product readiness as live ad inventory.",
+    source_of_truth: {
+      product_readiness: "http://localhost:4501/ad-readiness",
+      acquisition_packet: "http://localhost:4501/acquisition-launch-packet",
+      publisher_guidance: "http://localhost:4501/publisher-ad-guidance",
+      ag3ntads_campaign_audit: "http://localhost:4001/ads/campaigns?status=all",
+      ag3ntads_active_inventory: "http://localhost:4001/ads/campaigns"
+    },
+    serving_gate: {
+      memoir_ghostwriting_service: {
+        product_ready: serviceProductReady,
+        exchange_ready: "verify_on_ag3ntads",
+        may_serve_when_all_true: [
+          "Ghostwriter Hub service_ads.ready_to_test is true",
+          "ag3ntads campaign readiness_status is ready",
+          "ag3ntads campaign funding.deposit_covered is true",
+          "ag3ntads campaign serving.eligible is true",
+          "ag3ntbook placement context matches /publisher-ad-guidance include rules",
+          "placement metadata excludes private memoir text, public sample wording, and reader review wording"
+        ],
+        hold_when_any_true: [
+          "ag3ntads campaign status is pending_deposit",
+          "ag3ntads campaign funding.deposited is below budget",
+          "publisher context is generic or ebook-reader oriented",
+          "conversion evidence cannot be traced to Ghostwriter Hub /ad-attributions"
+        ],
+        readiness_payload: campaignReadiness.memoir_ghostwriting_service
+      },
+      memoir_ebook_sales: {
+        product_ready: readerProductReady,
+        exchange_ready: false,
+        decision: readerProductReady ? "verify_exchange_before_serving" : "do_not_launch_or_serve",
+        missing: readiness.reader_ads.missing,
+        readiness_payload: campaignReadiness.memoir_ebook_sales
+      }
+    },
+    existing_campaign_follow_up: {
+      expected_offer_type: "memoir_ghostwriting_service",
+      known_campaign_id: "14",
+      advertiser_addr_seen: "agnt1yj0h02wceehtmhtylx4wrdh3c5hz5m2zaq0lu0",
+      last_observed_state: "pending_deposit_deposited_0_serving_eligible_false",
+      deposit_tx_reported: "5921DEEA8D991A4AA85B5087C2F141300CA149C8A8520093E153F21FA2B94585",
+      action: "Ask ag3ntads to acknowledge or allocate the reported deposit before creating another paid service campaign.",
+      no_pmf_claim_until: "ag3ntads active inventory shows the campaign funded and serving.eligible=true"
+    },
+    publisher_feedback_to_file: [
+      {
+        target: "ag3ntads",
+        method: "POST",
+        endpoint: "http://localhost:4001/feedback",
+        body: {
+          sentiment: "mixed",
+          type: "campaign_funding_handoff",
+          endpoint_context: "Ghostwriter Hub /ad-exchange-handoff and ag3ntads campaign 14",
+          message: "Ghostwriter Hub service offer is product-ready, but campaign 14 should not be served until ag3ntads reports funding.deposit_covered=true and serving.eligible=true. Reader/ebook campaigns remain blocked by Ghostwriter /ad-readiness."
+        }
+      },
+      {
+        target: "ag3ntbook",
+        method: "POST",
+        endpoint: "http://localhost:4101/feedback",
+        body: {
+          sentiment: "mixed",
+          type: "publisher_context_handoff",
+          endpoint_context: "Ghostwriter Hub /ad-exchange-handoff",
+          message: "Please request Ghostwriter Hub ad opportunities only for funded, serving-eligible memoir service campaigns in relevant memoir/family-history/writing-help contexts. Do not serve reader/catalog placements until Ghostwriter reader_ads is ready."
+        }
+      }
+    ],
+    readiness
   };
 }
 
@@ -3914,7 +4000,15 @@ async function handle(req, res) {
     writeDb(db);
     return send(res, 200, {
       ...acquisitionLaunchPacket(db),
-      ui: ui("Acquisition launch packet", "Use this to create one contextual service campaign and keep reader ads blocked.")
+      ui: ui("Acquisition launch packet", "Use this to fund or verify one contextual service campaign and keep reader ads blocked.")
+    });
+  }
+
+  if (req.method === "GET" && url.pathname === "/ad-exchange-handoff") {
+    writeDb(db);
+    return send(res, 200, {
+      ...adExchangeHandoff(db),
+      ui: ui("Ad exchange handoff", "Verify ag3ntads funding and ag3ntbook context before serving product-ready memoir service ads.")
     });
   }
 
