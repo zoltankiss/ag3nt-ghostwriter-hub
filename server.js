@@ -509,6 +509,59 @@ function canViewProposal(db, proposal, actor) {
   return proposalParticipantAddresses(db, proposal).has(actor.address);
 }
 
+function proposalResponseState(db, proposal) {
+  const brief = proposal?.brief_id ? db.briefs.find((candidate) => candidate.id === proposal.brief_id) : null;
+  const sample = proposal?.sample_id ? db.samples.find((candidate) => candidate.id === proposal.sample_id) : null;
+  const buyerAddrs = new Set([proposal?.buyer_addr, brief?.actor?.address].filter(Boolean));
+  const writerAddrs = new Set([proposal?.payee_addr, sample?.actor?.address].filter(Boolean));
+  const messages = (proposal?.messages || []).map((message) => {
+    const role = String(message.role || "").toLowerCase();
+    const addr = message.actor?.address;
+    const side = writerAddrs.has(addr) || /writer|payee|seller/.test(role)
+      ? "writer"
+      : buyerAddrs.has(addr) || /buyer|client|payer/.test(role)
+        ? "buyer"
+        : "participant";
+    return { side, at: message.at };
+  });
+  const buyerMessages = messages.filter((message) => message.side === "buyer");
+  const writerMessages = messages.filter((message) => message.side === "writer");
+  const latestBuyerAt = buyerMessages.at(-1)?.at || null;
+  const latestWriterAt = writerMessages.at(-1)?.at || null;
+  const latestMessage = messages.at(-1) || null;
+  const waitingOn = !latestMessage
+    ? "participant"
+    : latestMessage.side === "buyer"
+      ? "writer"
+      : latestMessage.side === "writer"
+        ? "buyer"
+        : "participant";
+  const latestAtMs = latestMessage?.at ? new Date(latestMessage.at).getTime() : NaN;
+  const hoursSinceLatest = Number.isFinite(latestAtMs)
+    ? Math.max(0, Math.round(((Date.now() - latestAtMs) / 3_600_000) * 100) / 100)
+    : null;
+  const writerRespondedAfterBuyer = Boolean(
+    latestBuyerAt &&
+    latestWriterAt &&
+    new Date(latestWriterAt).getTime() > new Date(latestBuyerAt).getTime()
+  );
+  const staleThresholdHours = 12;
+  return {
+    message_count: messages.length,
+    buyer_message_count: buyerMessages.length,
+    writer_message_count: writerMessages.length,
+    latest_buyer_message_at: latestBuyerAt,
+    latest_writer_message_at: latestWriterAt,
+    waiting_on: waitingOn,
+    writer_responded_after_latest_buyer: writerRespondedAfterBuyer,
+    response_sla_hours: staleThresholdHours,
+    stale_private_thread: waitingOn === "writer" && hoursSinceLatest !== null && hoursSinceLatest >= staleThresholdHours,
+    buyer_funding_guidance: writerRespondedAfterBuyer || (!latestBuyerAt && latestWriterAt)
+      ? "Writer has responded in the thread; confirm scope, terms, payee, and fund only with verified escrow."
+      : "Do not fund private memoir details until the signed writer has answered with questions, scope, terms, and payee confirmation."
+  };
+}
+
 function verifiedEscrowForOrder(db, order) {
   if (!order) return null;
   return db.escrows.slice().reverse().find((escrow) =>
@@ -954,11 +1007,13 @@ function publicSample(sample) {
 
 function publicProposal(db, proposal, actor) {
   const canViewFull = canViewProposal(db, proposal, actor);
-  const { messages, raw, ...base } = proposal;
+  const { messages = [], raw, ...base } = proposal;
+  const response_state = proposalResponseState(db, proposal);
   return {
     ...base,
     participant_addrs: canViewFull ? [...proposalParticipantAddresses(db, proposal)] : undefined,
     message_count: messages.length,
+    response_state,
     messages: canViewFull ? messages : "withheld_from_public_listing",
     raw: canViewFull ? raw : undefined
   };
@@ -1187,9 +1242,16 @@ function writerDashboard(db, actor, writerAddr = null) {
   const awaitingAcknowledgement = paidWork.filter((order) => !latestWriterAcknowledgementForOrder(db, order) && !verifiedWriterDeliveryForOrder(db, order));
   const paidHistory = orders.filter((order) => releasedEscrowForOrder(db, order));
   const escrowBait = orders.filter((order) => !verifiedEscrowForOrder(db, order));
+  const proposalInbox = addr
+    ? db.proposals.filter((proposal) => {
+      const participants = proposalParticipantAddresses(db, proposal);
+      return participants.has(addr) && proposalResponseState(db, proposal).waiting_on === "writer";
+    })
+    : [];
   return {
     writer_addr: canUseSignedQueue ? addr : addr || "sign_request_or_pass_writer_addr",
     signed_private_queue: canUseSignedQueue,
+    proposal_inbox: proposalInbox.map((proposal) => publicProposal(db, proposal, actor)),
     paid_work_queue: paidWork.map((order) => publicOrderSummary(db, order, actor)),
     awaiting_writer_acknowledgement: awaitingAcknowledgement.map((order) => publicOrderSummary(db, order, actor)),
     paid_history: paidHistory.map((order) => publicOrderSummary(db, order, actor)),
@@ -1197,6 +1259,7 @@ function writerDashboard(db, actor, writerAddr = null) {
     verified_reviews: addr ? writerReputation(db, addr, actor).reviews : [],
     next_actions: {
       safe_delivery: "Deliver only orders in paid_work_queue with verified escrow.",
+      answer_private_proposals: "Reply to proposal_inbox with questions, scope, terms, and payee confirmation before asking for escrow.",
       acknowledge_funded_order: "POST /order-acknowledgements with {order_id, eta, planned_interview_questions, scope_note}.",
       decline_bait: "POST /order-declines with {order_id, reason} for unfunded or bogus escrow orders.",
       reputation: addr ? `/writers/${addr}/reputation` : "Sign as writer to view wallet reputation."
@@ -1864,11 +1927,13 @@ async function handle(req, res) {
       order.status = hasVerifiedEscrow ? "funded" : "awaiting_verified_escrow";
       order.risk_flags = Array.from(new Set([...(order.risk_flags || []), "unverified_escrow", ...match.failures]));
     }
+    reconcileOrderTrust(db);
     writeDb(db);
     return send(res, 201, {
       ok: true,
-      escrow: item,
-      order,
+      escrow: publicEscrow(db, item, actor),
+      order: order ? publicOrderSummary(db, order, actor) : null,
+      trust: order ? publicTrustState(db, order, actor) : null,
       ui: ui(chainFunded ? "Escrow verified" : "Escrow not verified", chainFunded ? "Funded orders can proceed to delivery." : "Provide a real numeric chain escrow id before this order counts as funded.")
     });
   }
