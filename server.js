@@ -1268,6 +1268,7 @@ function publicHandoffCheckoutSummary(db, handoff, actor = {}) {
     verified_funded_order_count: checkout.downstream.verified_funded_order_count,
     accepted_delivery_count: checkout.downstream.accepted_delivery_count,
     released_paid_order_count: checkout.downstream.released_paid_order_count,
+    ready_ad_attribution_count: checkout.downstream.ready_ad_attribution_count,
     counts_as_conversion: checkout.gates.counts_as_conversion,
     next_action: checkout.next_action,
     audit_path: `/publisher-checkouts?handoff_id=${handoff.id}`,
@@ -1595,6 +1596,15 @@ function handoffLinkedOrders(db, handoff) {
   );
 }
 
+function handoffLinkedAdAttributions(db, linkedOrders = []) {
+  const linkedOrderIds = new Set(linkedOrders.map((order) => order.id));
+  return db.ad_attributions.filter((attribution) =>
+    attribution.order_id &&
+    linkedOrderIds.has(attribution.order_id) &&
+    attribution.status === "ready_to_attest"
+  );
+}
+
 function handoffLinkedDownstreamState(db, handoff) {
   const linkedBriefIds = handoffLinkedBriefIds(db, handoff);
   const linkedProposalIds = handoffLinkedProposalIds(db, handoff, linkedBriefIds);
@@ -1602,6 +1612,7 @@ function handoffLinkedDownstreamState(db, handoff) {
   const fundedOrders = linkedOrders.filter((order) => Boolean(verifiedEscrowForOrder(db, order)));
   const acceptedOrders = linkedOrders.filter((order) => Boolean(orderTrustState(db, order).accepted_delivery));
   const releasedOrders = linkedOrders.filter((order) => Boolean(releasedEscrowForOrder(db, order)));
+  const readyAdAttributions = handoffLinkedAdAttributions(db, linkedOrders);
   return {
     linked_brief_ids: [...linkedBriefIds],
     linked_proposal_ids: [...linkedProposalIds],
@@ -1609,11 +1620,14 @@ function handoffLinkedDownstreamState(db, handoff) {
     verified_funded_order_count: fundedOrders.length,
     accepted_delivery_count: acceptedOrders.length,
     released_paid_order_count: releasedOrders.length,
+    ready_ad_attribution_count: readyAdAttributions.length,
     funded_value: fundedOrders.reduce((sum, order) => sum + money(order.amount), 0),
     downstream_conversion_state: releasedOrders.length
       ? "released_paid_work"
       : acceptedOrders.length
         ? "accepted_delivery"
+        : readyAdAttributions.length
+          ? "ready_ad_attribution"
         : fundedOrders.length
           ? "verified_funded_order"
           : linkedOrders.length
@@ -1645,6 +1659,9 @@ function publisherCheckoutForHandoff(db, handoff, actor = {}) {
   const hasAcceptance = Boolean(trust?.accepted_delivery);
   const hasRelease = Boolean(trust?.released_escrow);
   const hasRefundOrDispute = orderHasRefundOrDispute(db, selectedOrder);
+  const linkedReadyAdAttributions = handoffLinkedAdAttributions(db, linkedOrders);
+  const hasReadyAdAttribution = linkedReadyAdAttributions.length > 0;
+  const countsAsConversion = hasVerifiedEscrow || hasAcceptance || hasRelease || hasReadyAdAttribution;
   const checkoutStatus =
     hasRelease
       ? "released_paid_work"
@@ -1701,7 +1718,20 @@ function publisherCheckoutForHandoff(db, handoff, actor = {}) {
       accepted_delivery: hasAcceptance,
       released_paid_work: hasRelease,
       refund_or_dispute_recorded: hasRefundOrDispute,
-      counts_as_conversion: hasVerifiedEscrow || hasAcceptance || hasRelease
+      ready_ad_attribution: hasReadyAdAttribution,
+      counts_as_conversion: countsAsConversion
+    },
+    conversion_evidence: {
+      counts_as_conversion: countsAsConversion,
+      eligible_events: [
+        ...(hasVerifiedEscrow ? ["verified_funded_order"] : []),
+        ...(hasAcceptance ? ["accepted_delivery"] : []),
+        ...(hasRelease ? ["released_paid_work"] : []),
+        ...(hasReadyAdAttribution ? ["ready_ad_attribution"] : [])
+      ],
+      ready_ad_attribution_count: linkedReadyAdAttributions.length,
+      ready_ad_attribution_ids: linkedReadyAdAttributions.map((attribution) => attribution.id),
+      policy: "Publisher checkout conversion evidence must be downstream and paid: verified funded order, accepted delivery, released paid work, or ready ag3ntads attribution. Drafts, native starts, proposals, and awaiting-escrow orders do not count."
     },
     missing_next: missingNext,
     next_action: missingNext[0] || "buyer_can_leave_verified_review_or_fund_next_milestone",
@@ -1745,6 +1775,7 @@ function publisherCheckoutAudit(db, actor = {}, filters = {}) {
       substantive_deliveries: filtered.filter((checkout) => checkout.gates.substantive_memoir_delivery).length,
       accepted_deliveries: filtered.filter((checkout) => checkout.gates.accepted_delivery).length,
       released_paid_work: filtered.filter((checkout) => checkout.gates.released_paid_work).length,
+      ready_ad_attributions: filtered.reduce((sum, checkout) => sum + checkout.conversion_evidence.ready_ad_attribution_count, 0),
       refund_or_dispute_recorded: filtered.filter((checkout) => checkout.gates.refund_or_dispute_recorded).length,
       conversion_eligible_handoffs: conversionEligible.length
     },
@@ -1839,6 +1870,7 @@ function publisherHandoffQuality(db) {
   const fundedFromHandoffs = downstreamStates.filter((state) => state.verified_funded_order_count > 0);
   const acceptedFromHandoffs = downstreamStates.filter((state) => state.accepted_delivery_count > 0);
   const releasedFromHandoffs = downstreamStates.filter((state) => state.released_paid_order_count > 0);
+  const attributedFromHandoffs = downstreamStates.filter((state) => state.ready_ad_attribution_count > 0);
   const reasons = blocked.flatMap((handoff) => handoff.blocked_reasons || []);
   const reasonCounts = [...new Set(reasons)].map((reason) => ({
     reason,
@@ -1874,6 +1906,7 @@ function publisherHandoffQuality(db) {
       linked_verified_funded_handoffs: fundedFromHandoffs.length,
       linked_accepted_delivery_handoffs: acceptedFromHandoffs.length,
       linked_released_paid_handoffs: releasedFromHandoffs.length,
+      linked_ready_ad_attribution_handoffs: attributedFromHandoffs.length,
       linked_funded_value: downstreamStates.reduce((sum, state) => sum + state.funded_value, 0)
     },
     reason_counts: reasonCounts,
