@@ -257,6 +257,7 @@ function discovery() {
       { method: "GET", path: "/offers", summary: "Browse available supply." },
       { method: "POST", path: "/matches", summary: "Propose a match. Body {intent_id,offer_id,note}." },
       { method: "POST", path: "/orders", summary: "Commit to a workflow. Body {brief_id,sample_id,proposal_id,amount,payee_addr,deliverable,delivery_due_at,escrow_id}. Positive signed orders without escrow are marked awaiting_escrow." },
+      { method: "GET", path: "/milestones", summary: "Audit public-safe paid memoir milestone economics. Filters: ?role=buyer|writer&status=funded|released_paid&type=paid_diagnostic|chapter_milestone|full_manuscript." },
       { method: "POST", path: "/escrows", summary: "Attach payment proof/status. Body {order_id,escrow_id,payer_addr,payee_addr,amount,status,proof}." },
       { method: "POST", path: "/deliveries", summary: "Writer delivery. Body {order_id,content_hash,scene_objective,interview_questions,outline_beats,draft,excerpt,rights_transfer,notes,revised_from_revision_id,supersedes_delivery_id}." },
       { method: "POST", path: "/order-acknowledgements", summary: "Signed writer acknowledges a verified funded order before delivery. Body {order_id,eta,planned_interview_questions,scope_note}." },
@@ -335,8 +336,12 @@ function publicActivity(db, actor = {}) {
       funded_milestones: db.orders.filter((order) => orderTrustState(db, order).verified_escrow).length,
       accepted_deliveries: db.orders.filter((order) => orderTrustState(db, order).accepted_delivery).length,
       released_escrow: db.orders.filter((order) => orderTrustState(db, order).released_escrow).length,
+      paid_diagnostic_milestones: db.orders.filter((order) => orderTrustState(db, order).verified_escrow && orderEconomics(order).milestone_type === "paid_diagnostic").length,
+      funded_chapter_milestones: db.orders.filter((order) => orderTrustState(db, order).verified_escrow && orderEconomics(order).milestone_type === "chapter_milestone").length,
+      funded_full_manuscript_milestones: db.orders.filter((order) => orderTrustState(db, order).verified_escrow && orderEconomics(order).milestone_type === "full_manuscript").length,
+      refund_requests: db.refunds.filter((refund) => refund.status === "refund_requested").length,
       repeat_buyer_intent: db.reviews.filter((review) => review.status === "verified_paid_review" && review.would_pay_again === true).length,
-      writer_earnings: db.orders.reduce((sum, order) => sum + (orderTrustState(db, order).released_escrow ? Number(order.amount || 0) : 0), 0),
+      writer_earnings: db.orders.reduce((sum, order) => sum + (orderTrustState(db, order).released_escrow ? orderEconomics(order).writer_net_earnings : 0), 0),
       verified_reviews: db.reviews.filter((review) => review.status === "verified_paid_review").length,
       paid_reader_purchases: db.reader_purchases.filter((purchase) => purchase.status === "verified_paid_read_access").length,
       verified_reader_reviews: db.reader_reviews.filter((review) => review.status === "verified_reader_review").length,
@@ -345,7 +350,7 @@ function publicActivity(db, actor = {}) {
       writer_reader_royalties: db.reader_earnings.reduce((sum, earning) => sum + (earning.status === "earned_from_verified_reader_purchase" ? Number(earning.writer_royalty || 0) : 0), 0),
       rights_holder_reader_earnings: db.reader_earnings.reduce((sum, earning) => sum + (earning.status === "earned_from_verified_reader_purchase" ? Number(earning.rights_holder_earnings || 0) : 0), 0),
       platform_fees: [
-        ...db.orders.map((order) => orderTrustState(db, order).released_escrow ? Number(order.platform_fee || 0) : 0),
+        ...db.orders.map((order) => orderTrustState(db, order).released_escrow ? orderEconomics(order).platform_fee : 0),
         ...db.reader_earnings.map((earning) => earning.status === "earned_from_verified_reader_purchase" ? Number(earning.platform_fee || 0) : 0)
       ].reduce((sum, value) => sum + value, 0),
       ad_click_to_funded_order: db.ad_attributions.filter((attribution) => attribution.status === "ready_to_attest").length,
@@ -854,6 +859,11 @@ function reconcileOrderTrust(db) {
   }
 
   for (const order of db.orders) {
+    const economics = orderEconomics(order);
+    order.milestone_type = economics.milestone_type;
+    order.platform_fee_rate = economics.platform_fee_rate;
+    order.platform_fee = economics.platform_fee;
+    order.writer_net_earnings = economics.writer_net_earnings;
     const trust = orderTrustState(db, order);
     order.trust = {
       payment_state: trust.payment_state,
@@ -1144,6 +1154,41 @@ function money(value) {
   return Number.isFinite(numeric) ? Math.max(0, Math.round(numeric * 100) / 100) : 0;
 }
 
+function memoirMilestoneType(body = {}) {
+  const explicit = String(body.milestone_type || body.milestone || body.stage || "").toLowerCase();
+  const text = [
+    explicit,
+    body.deliverable,
+    body.outcome,
+    body.acceptance_criteria,
+    body.scope,
+    body.brief,
+    body.raw?.deliverable,
+    body.raw?.outcome,
+    body.raw?.acceptance_criteria
+  ].filter(Boolean).join(" ").toLowerCase();
+  if (/full.?manuscript|complete manuscript|book draft|whole book|memoir manuscript/.test(text)) return "full_manuscript";
+  if (/chapter|scene|opening|outline|beat sheet|structure|revision/.test(text)) return "chapter_milestone";
+  if (/diagnostic|sample|interview|brief|strategy|assessment|voice audit/.test(text)) return "paid_diagnostic";
+  return "custom_milestone";
+}
+
+function orderEconomics(order = {}) {
+  const gross = money(order.amount);
+  const rateValue = Number(order.platform_fee_rate ?? order.raw?.platform_fee_rate ?? 0.15);
+  const platformFeeRate = Number.isFinite(rateValue) && rateValue >= 0 ? rateValue : 0.15;
+  const platformFee = order.platform_fee !== undefined ? money(order.platform_fee) : money(gross * platformFeeRate);
+  const writerNet = order.writer_net_earnings !== undefined ? money(order.writer_net_earnings) : money(gross - platformFee);
+  return {
+    milestone_type: order.milestone_type || memoirMilestoneType(order.raw || order),
+    gross_amount: gross,
+    platform_fee_rate: platformFeeRate,
+    platform_fee: platformFee,
+    writer_net_earnings: writerNet,
+    money_policy: "Order proceeds count as writer earnings and platform fees only after verified escrow release."
+  };
+}
+
 function readerEarningSplit(publication, amountValue) {
   const amount = money(amountValue);
   const publishedPrice = money(publication?.price);
@@ -1303,8 +1348,13 @@ function publicProposal(db, proposal, actor) {
 
 function publicOrder(order, actor) {
   const canViewFull = actorCanViewOrderPrivate(order, actor);
+  const economics = orderEconomics(order);
   return {
     ...order,
+    economics: {
+      ...economics,
+      writer_earnings_state: order.trust?.payment_state === "released_paid" ? "earned_after_release" : "pending_verified_release"
+    },
     deliverable: canViewFull ? order.deliverable : "Memoir deliverable withheld from public listing.",
     raw: canViewFull ? order.raw : undefined,
     linked_private_thread: Boolean(order.proposal_id),
@@ -1886,16 +1936,24 @@ function writerReputation(db, writerAddr, actor = {}) {
     });
   const releasedPaidOrders = orders.filter((order) => orderTrustState(db, order).payment_state === "released_paid");
   const acceptedDeliveries = orders.filter((order) => Boolean(orderTrustState(db, order).accepted_delivery));
-  const writerEarnings = releasedPaidOrders.reduce((sum, order) => sum + (Number(order.amount) || 0), 0);
+  const writerEarnings = releasedPaidOrders.reduce((sum, order) => sum + orderEconomics(order).writer_net_earnings, 0);
+  const platformFees = releasedPaidOrders.reduce((sum, order) => sum + orderEconomics(order).platform_fee, 0);
   return {
     writer_addr: writerAddr,
     verified_paid_reviews: verifiedReviews.length,
     accepted_deliveries: acceptedDeliveries.length,
     released_paid_orders: releasedPaidOrders.length,
     writer_earnings: writerEarnings,
+    platform_fees_on_released_work: platformFees,
+    milestone_mix: {
+      paid_diagnostic: orders.filter((order) => orderEconomics(order).milestone_type === "paid_diagnostic").length,
+      chapter_milestone: orders.filter((order) => orderEconomics(order).milestone_type === "chapter_milestone").length,
+      full_manuscript: orders.filter((order) => orderEconomics(order).milestone_type === "full_manuscript").length,
+      custom_milestone: orders.filter((order) => orderEconomics(order).milestone_type === "custom_milestone").length
+    },
     repeat_buyer_intent: verifiedReviews.filter((review) => review.would_pay_again === true).length,
     reviews: verifiedReviews.map((review) => publicReview(db, review, actor)),
-    proof_policy: "Reputation counts only buyer reviews after verified escrow, accepted memoir-quality delivery, and released escrow."
+    proof_policy: "Reputation counts only buyer reviews after verified escrow, accepted memoir-quality delivery, and released escrow. Writer earnings are net of the platform fee."
   };
 }
 
@@ -2064,6 +2122,48 @@ async function handle(req, res) {
         funded: fundedOnly
       },
       ui: ui("Orders", "Use ?role=writer&funded=true for a safe paid work queue, or ?status=awaiting_writer_delivery for funded delivery work.")
+    });
+  }
+
+  if (req.method === "GET" && url.pathname === "/milestones") {
+    let orders = db.orders.slice();
+    const roleFilter = url.searchParams.get("role");
+    const statusFilter = url.searchParams.get("status");
+    const typeFilter = url.searchParams.get("type") || url.searchParams.get("milestone_type");
+    if (roleFilter === "writer") {
+      orders = actor.signed ? orders.filter((order) => actorIsWriter(order, actor)) : [];
+    } else if (roleFilter === "buyer") {
+      orders = actor.signed ? orders.filter((order) => actorIsBuyer(order, actor)) : [];
+    }
+    if (typeFilter) orders = orders.filter((order) => orderEconomics(order).milestone_type === typeFilter);
+    if (statusFilter === "funded") orders = orders.filter((order) => Boolean(verifiedEscrowForOrder(db, order)));
+    else if (statusFilter === "released_paid") orders = orders.filter((order) => Boolean(releasedEscrowForOrder(db, order)));
+    else if (statusFilter === "accepted") orders = orders.filter((order) => Boolean(orderTrustState(db, order).accepted_delivery));
+    const funded = orders.filter((order) => Boolean(verifiedEscrowForOrder(db, order)));
+    const released = orders.filter((order) => Boolean(releasedEscrowForOrder(db, order)));
+    writeDb(db);
+    return send(res, 200, {
+      milestones: orders.map((order) => publicOrderSummary(db, order, actor)),
+      summary: {
+        total_milestones: orders.length,
+        funded_milestones: funded.length,
+        released_paid_milestones: released.length,
+        gross_funded_value: funded.reduce((sum, order) => sum + orderEconomics(order).gross_amount, 0),
+        released_writer_earnings: released.reduce((sum, order) => sum + orderEconomics(order).writer_net_earnings, 0),
+        released_platform_fees: released.reduce((sum, order) => sum + orderEconomics(order).platform_fee, 0),
+        milestone_mix: {
+          paid_diagnostic: orders.filter((order) => orderEconomics(order).milestone_type === "paid_diagnostic").length,
+          chapter_milestone: orders.filter((order) => orderEconomics(order).milestone_type === "chapter_milestone").length,
+          full_manuscript: orders.filter((order) => orderEconomics(order).milestone_type === "full_manuscript").length,
+          custom_milestone: orders.filter((order) => orderEconomics(order).milestone_type === "custom_milestone").length
+        }
+      },
+      filters: {
+        role: roleFilter,
+        status: statusFilter,
+        milestone_type: typeFilter
+      },
+      ui: ui("Milestone economics", "Funded value, released writer earnings, and platform fees are public-safe; private memoir deliverables remain protected.")
     });
   }
 
@@ -2499,6 +2599,11 @@ async function handle(req, res) {
 
   if (req.method === "POST" && url.pathname === "/orders") {
     const amount = Number(body.amount || body.budget || 0);
+    const platformFeeRate = Number(body.platform_fee_rate ?? 0.15);
+    const normalizedPlatformFeeRate = Number.isFinite(platformFeeRate) && platformFeeRate >= 0 ? platformFeeRate : 0.15;
+    const platformFee = money(amount * normalizedPlatformFeeRate);
+    const writerNetEarnings = money(amount - platformFee);
+    const milestoneType = memoirMilestoneType(body);
     const risk_flags = [];
     if (!actor.address) risk_flags.push("missing_actor_wallet_address");
     if (!body.payee_addr) risk_flags.push("missing_payee_wallet_address");
@@ -2523,6 +2628,10 @@ async function handle(req, res) {
       sample_id: body.sample_id || null,
       proposal_id: body.proposal_id || null,
       amount: Number.isFinite(amount) ? amount : null,
+      milestone_type: milestoneType,
+      platform_fee_rate: normalizedPlatformFeeRate,
+      platform_fee: platformFee,
+      writer_net_earnings: writerNetEarnings,
       payee_addr: body.payee_addr || null,
       escrow_id: body.escrow_id || null,
       escrow_proof: body.escrow_proof || null,
