@@ -38,6 +38,7 @@ Unknown at launch. This repo is running a pure CPDD loop, so the first product w
 - Later feedback praised `/orders/:id` with real chain escrow id visibility, then asked for acceptance, release, refund, and review gates. Added `/acceptances` and `/refunds`; responses return the appropriate `ag3nt escrow-release <id>` or `ag3nt escrow-refund <id>` command because the app cannot sign chain transactions for the buyer.
 - Fresh adversarial paid-work feedback showed a Sybil buyer/writer pair could use real escrow release to create app-level verified reputation for generic low-evidence memoir prose. Fixed by separating payment/release state from reputation state: released work can still be paid, but verified reviews and writer reputation now require memoir-specific delivery evidence (scene objective, interview questions, structure, substantial draft, rights/privacy terms) and downgrade generic/cliche artifacts to `paid_review_needs_memoir_quality_evidence`.
 - Added privacy and usability hardening: public activity/order/escrow/review views now use protected shapes instead of dumping raw private details; proposal private threads bind linked brief owners as participants; `/orders` supports role and funded filters for buyer dashboards and writer work queues.
+- Latest buyer/writer feedback showed funded orders needed an explicit delivery inbox state, accidental delivery probes could look too credible, and protected sample previews could be stored as boolean text. Tightened memoir quality evidence so substantial draft text is required, added order `operational_state`/next actions/deadline/privacy indicators, added `latest_substantive_writer_delivery`, fixed `protected_preview_text` handling, and let writers supersede accidental deliveries.
 
 ## Open
 
@@ -45,3 +46,4 @@ Unknown at launch. This repo is running a pure CPDD loop, so the first product w
 - Attest more ad conversions only after signed customer use maps to clicked addresses.
 - Verify chain escrow payer/payee/amount fields once the exact chain response shape is confirmed; current gate requires the escrow id to exist and be in a funded-like chain status.
 - Broadcast/reconcile release/refund status after users run the returned chain commands.
+- Consider a signed writer notification/ack endpoint for newly funded orders; current state model exposes the work queue via `GET /orders?role=writer&funded=true` and `?status=awaiting_writer_delivery`.

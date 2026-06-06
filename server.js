@@ -237,7 +237,7 @@ function discovery() {
       { method: "GET", path: "/", summary: "Current product map and next actions." },
       { method: "POST", path: "/briefs", summary: "Memoir buyer: post a writing brief. Body {story,audience,tone,budget,deadline,privacy}." },
       { method: "GET", path: "/briefs", summary: "Browse open ghostwriting briefs." },
-      { method: "POST", path: "/samples", summary: "Writer: submit a sample for a brief. Body {brief_id,excerpt,price,terms,proof}." },
+      { method: "POST", path: "/samples", summary: "Writer: submit a sample for a brief. Body {brief_id,protected_preview_text,full_excerpt,price,terms,proof}." },
       { method: "GET", path: "/samples", summary: "Browse writer samples." },
       { method: "POST", path: "/proposals", summary: "Writer/buyer proposal thread. Body {brief_id,sample_id,match_id,role,message,questions,terms,payee_addr,milestone_amount,visibility}." },
       { method: "GET", path: "/proposals", summary: "Browse public proposal headers and private-thread metadata." },
@@ -249,9 +249,9 @@ function discovery() {
       { method: "POST", path: "/offers", summary: "Declare what you can provide. Body {can_do,price,proof,terms}. Sign it when serious." },
       { method: "GET", path: "/offers", summary: "Browse available supply." },
       { method: "POST", path: "/matches", summary: "Propose a match. Body {intent_id,offer_id,note}." },
-      { method: "POST", path: "/orders", summary: "Commit to a workflow. Body {brief_id,sample_id,intent_id,offer_id,amount,payee_addr,deliverable,escrow_id}. Positive signed orders without escrow are marked awaiting_escrow." },
+      { method: "POST", path: "/orders", summary: "Commit to a workflow. Body {brief_id,sample_id,proposal_id,amount,payee_addr,deliverable,delivery_due_at,escrow_id}. Positive signed orders without escrow are marked awaiting_escrow." },
       { method: "POST", path: "/escrows", summary: "Attach payment proof/status. Body {order_id,escrow_id,payer_addr,payee_addr,amount,status,proof}." },
-      { method: "POST", path: "/deliveries", summary: "Writer delivery. Body {order_id,content_hash,scene_objective,interview_questions,outline_beats,draft,excerpt,rights_transfer,notes,revised_from_revision_id}." },
+      { method: "POST", path: "/deliveries", summary: "Writer delivery. Body {order_id,content_hash,scene_objective,interview_questions,outline_beats,draft,excerpt,rights_transfer,notes,revised_from_revision_id,supersedes_delivery_id}." },
       { method: "POST", path: "/revisions", summary: "Buyer revision request. Body {order_id,delivery_id,request,acceptance_blocker,rubric}." },
       { method: "POST", path: "/disputes", summary: "Open dispute/refund concern. Body {order_id,reason,requested_resolution}." },
       { method: "POST", path: "/acceptances", summary: "Buyer accepts delivery and gets release command. Body {order_id,delivery_id,notes}." },
@@ -316,7 +316,7 @@ function publicActivity(db, actor = {}) {
     recent_escrows: db.escrows.slice(-10).reverse().map((escrow) => publicEscrow(db, escrow, actor)),
     recent_intents: db.intents.slice(-10).reverse(),
     recent_offers: db.offers.slice(-10).reverse(),
-    recent_orders: db.orders.slice(-10).reverse().map((order) => publicOrder(order, actor)),
+    recent_orders: db.orders.slice(-10).reverse().map((order) => publicOrderSummary(db, order, actor)),
     recent_deliveries: db.deliveries.slice(-10).reverse().map((delivery) => publicDelivery(db, delivery, db.orders.find((order) => order.id === delivery.order_id), actor)),
     recent_revisions: db.revisions.slice(-10).reverse(),
     recent_disputes: db.disputes.slice(-10).reverse(),
@@ -451,8 +451,33 @@ function deliveryQualityEvidence(delivery) {
     evidence.has_substantial_draft,
     evidence.has_rights_terms
   ].filter(Boolean).length - (evidence.appears_generic ? 2 : 0);
-  evidence.status = evidence.score >= 3 ? "memoir_quality_evidence_present" : "needs_memoir_quality_evidence";
+  evidence.status = evidence.score >= 3 && evidence.has_substantial_draft ? "memoir_quality_evidence_present" : "needs_memoir_quality_evidence";
   return evidence;
+}
+
+function deliveryIsSubstantive(delivery) {
+  return deliveryQualityEvidence(delivery).status === "memoir_quality_evidence_present";
+}
+
+function latestRevisionAfterDelivery(db, order, delivery) {
+  if (!order || !delivery) return null;
+  return db.revisions.slice().reverse().find((revision) =>
+    revision.order_id === order.id &&
+    revision.status === "requested" &&
+    revision.delivery_id === delivery.id &&
+    new Date(revision.at).getTime() >= new Date(delivery.at).getTime()
+  ) || null;
+}
+
+function latestSubstantiveWriterDeliveryForOrder(db, order) {
+  if (!order) return null;
+  return db.deliveries.slice().reverse().find((delivery) =>
+    delivery.order_id === order.id &&
+    delivery.actor?.signed &&
+    isSameAddress(delivery.actor.address, order.payee_addr) &&
+    ["submitted", "revised", "accepted", "accepted_pending_release", "released_paid"].includes(String(delivery.status || "").toLowerCase()) &&
+    deliveryIsSubstantive(delivery)
+  ) || null;
 }
 
 function reputationEligibleAcceptance(db, order, deliveryId = null) {
@@ -478,8 +503,10 @@ function releasedEscrowForOrder(db, order) {
 function orderTrustState(db, order) {
   const verified_escrow = verifiedEscrowForOrder(db, order);
   const latest_writer_delivery = verifiedWriterDeliveryForOrder(db, order);
-  const accepted_delivery = verifiedAcceptanceForOrder(db, order, latest_writer_delivery?.id);
-  const quality_evidence = latest_writer_delivery ? deliveryQualityEvidence(latest_writer_delivery) : null;
+  const latest_substantive_writer_delivery = latestSubstantiveWriterDeliveryForOrder(db, order);
+  const accepted_delivery = verifiedAcceptanceForOrder(db, order, latest_substantive_writer_delivery?.id || latest_writer_delivery?.id);
+  const quality_evidence = latest_substantive_writer_delivery ? deliveryQualityEvidence(latest_substantive_writer_delivery) : latest_writer_delivery ? deliveryQualityEvidence(latest_writer_delivery) : null;
+  const latest_revision_request = latestRevisionAfterDelivery(db, order, latest_substantive_writer_delivery || latest_writer_delivery);
   const reputation_eligible_acceptance = accepted_delivery && quality_evidence?.status === "memoir_quality_evidence_present" ? accepted_delivery : null;
   const released_escrow = accepted_delivery ? releasedEscrowForOrder(db, order) : null;
   return {
@@ -487,7 +514,9 @@ function orderTrustState(db, order) {
     writer_addr: order?.payee_addr || null,
     verified_escrow: verified_escrow || null,
     latest_writer_delivery: latest_writer_delivery || null,
+    latest_substantive_writer_delivery: latest_substantive_writer_delivery || null,
     delivery_quality_evidence: quality_evidence,
+    latest_revision_request: latest_revision_request || null,
     accepted_delivery: accepted_delivery || null,
     reputation_eligible_acceptance: reputation_eligible_acceptance || null,
     released_escrow: released_escrow || null,
@@ -495,6 +524,51 @@ function orderTrustState(db, order) {
     rights_state: released_escrow ? "transferred_after_release" : accepted_delivery ? "accepted_not_transferred_until_release" : "not_transferred",
     writer_reputation_state: released_escrow && reputation_eligible_acceptance ? "earned_paid_delivery" : released_escrow ? "paid_needs_memoir_quality_evidence" : accepted_delivery ? "pending_release" : verified_escrow ? "pending_delivery_acceptance" : "not_earned"
   };
+}
+
+function orderOperationalState(db, order) {
+  const trust = orderTrustState(db, order);
+  const state = {
+    state: "unfunded",
+    deadline: order?.delivery_due_at || order?.raw?.delivery_due_at || order?.raw?.deadline || null,
+    next_actions: [],
+    privacy: {
+      linked_private_thread: Boolean(order?.proposal_id),
+      private_material_visible_to: "buyer_and_writer_after_verified_escrow",
+      public_previews_only: true
+    }
+  };
+  if (!order?.actor?.signed) {
+    state.state = "unsigned_draft";
+    state.next_actions.push("buyer_sign_order");
+  } else if (!trust.verified_escrow) {
+    state.state = "awaiting_verified_escrow";
+    state.next_actions.push("buyer_attach_numeric_chain_escrow");
+  } else if (!trust.latest_writer_delivery) {
+    state.state = "awaiting_writer_delivery";
+    state.next_actions.push("writer_submit_funded_diagnostic_delivery");
+    state.next_actions.push("buyer_may_request_refund_or_open_dispute_if_deadline_missed");
+  } else if (!trust.latest_substantive_writer_delivery) {
+    state.state = "awaiting_substantive_writer_delivery";
+    state.next_actions.push("writer_supersede_probe_with_questions_scene_structure_rights_terms");
+    state.next_actions.push("buyer_request_revision_or_dispute_if_delivery_is_not_substantive");
+  } else if (trust.latest_revision_request && !trust.accepted_delivery) {
+    state.state = "awaiting_writer_revision";
+    state.next_actions.push("writer_submit_revised_delivery_linked_to_revision");
+  } else if (!trust.accepted_delivery) {
+    state.state = "awaiting_buyer_acceptance_or_revision";
+    state.next_actions.push("buyer_accept_delivery_or_request_focused_revision");
+  } else if (!trust.released_escrow) {
+    state.state = "accepted_pending_release";
+    state.next_actions.push("buyer_run_escrow_release_then_record_release");
+  } else if (trust.writer_reputation_state === "paid_needs_memoir_quality_evidence") {
+    state.state = "released_paid_needs_quality_evidence";
+    state.next_actions.push("writer_add_memoir_specific_evidence_before_review_counts");
+  } else {
+    state.state = "released_paid_review_ready";
+    state.next_actions.push("buyer_leave_verified_review");
+  }
+  return state;
 }
 
 function reconcileOrderTrust(db) {
@@ -639,7 +713,16 @@ function publicOrder(order, actor) {
     ...order,
     deliverable: canViewFull ? order.deliverable : previewText(order.deliverable, 220),
     raw: canViewFull ? order.raw : undefined,
-    protected_private_details: canViewFull ? false : true
+    linked_private_thread: Boolean(order.proposal_id),
+    protected_private_details: !canViewFull,
+    protected_linked_private_thread: Boolean(order.proposal_id) && !canViewFull
+  };
+}
+
+function publicOrderSummary(db, order, actor) {
+  return {
+    ...publicOrder(order, actor),
+    operational_state: orderOperationalState(db, order)
   };
 }
 
@@ -663,13 +746,16 @@ function publicEscrow(db, escrow, actor) {
 function publicDelivery(db, delivery, order, actor) {
   const quality_evidence = deliveryQualityEvidence(delivery);
   const canViewFull = order && actorCanViewOrderPrivate(order, actor) && verifiedEscrowForOrder(db, order);
+  const hasFullDraft = Boolean(delivery.draft);
   return {
     ...delivery,
     excerpt: canViewFull ? delivery.excerpt : previewText(delivery.excerpt, 280),
     draft: canViewFull ? delivery.draft : undefined,
     private_notes: canViewFull ? delivery.private_notes : undefined,
     quality_evidence,
-    protected_full_draft: canViewFull ? false : true,
+    substantive_delivery: deliveryIsSubstantive(delivery),
+    protected_full_draft_from_public: hasFullDraft,
+    full_draft_visible_to_actor: Boolean(canViewFull && hasFullDraft),
     raw: canViewFull ? delivery.raw : undefined
   };
 }
@@ -681,13 +767,16 @@ function publicTrustState(db, order, actor) {
     writer_addr: trust.writer_addr,
     verified_escrow: trust.verified_escrow ? publicEscrow(db, trust.verified_escrow, actor) : null,
     latest_writer_delivery: trust.latest_writer_delivery ? publicDelivery(db, trust.latest_writer_delivery, order, actor) : null,
+    latest_substantive_writer_delivery: trust.latest_substantive_writer_delivery ? publicDelivery(db, trust.latest_substantive_writer_delivery, order, actor) : null,
     delivery_quality_evidence: trust.delivery_quality_evidence,
+    latest_revision_request: trust.latest_revision_request,
     accepted_delivery: trust.accepted_delivery ? publicOrderArtifact(db, trust.accepted_delivery, actor) : null,
     reputation_eligible_acceptance: trust.reputation_eligible_acceptance ? publicOrderArtifact(db, trust.reputation_eligible_acceptance, actor) : null,
     released_escrow: trust.released_escrow ? publicOrderArtifact(db, trust.released_escrow, actor) : null,
     payment_state: trust.payment_state,
     rights_state: trust.rights_state,
-    writer_reputation_state: trust.writer_reputation_state
+    writer_reputation_state: trust.writer_reputation_state,
+    operational_state: orderOperationalState(db, order)
   };
 }
 
@@ -804,11 +893,15 @@ async function handle(req, res) {
     } else if (buyerFilter) {
       orders = orders.filter((order) => isSameAddress(order.actor?.address, buyerFilter));
     }
-    if (statusFilter) orders = orders.filter((order) => order.status === statusFilter || orderTrustState(db, order).payment_state === statusFilter);
+    if (statusFilter) orders = orders.filter((order) =>
+      order.status === statusFilter ||
+      orderTrustState(db, order).payment_state === statusFilter ||
+      orderOperationalState(db, order).state === statusFilter
+    );
     if (fundedOnly) orders = orders.filter((order) => Boolean(verifiedEscrowForOrder(db, order)));
     writeDb(db);
     return send(res, 200, {
-      orders: orders.map((order) => publicOrder(order, actor)),
+      orders: orders.map((order) => publicOrderSummary(db, order, actor)),
       filters: {
         status: statusFilter,
         payee_addr: payeeFilter,
@@ -816,7 +909,7 @@ async function handle(req, res) {
         role: roleFilter,
         funded: fundedOnly
       },
-      ui: ui("Orders", "Use ?role=writer&funded=true for a safe paid work queue, or ?role=buyer for your buyer dashboard.")
+      ui: ui("Orders", "Use ?role=writer&funded=true for a safe paid work queue, or ?status=awaiting_writer_delivery for funded delivery work.")
     });
   }
 
@@ -829,7 +922,7 @@ async function handle(req, res) {
     }
     writeDb(db);
     return send(res, 200, {
-      order: publicOrder(order, actor),
+      order: publicOrderSummary(db, order, actor),
       escrows: db.escrows.filter((item) => item.order_id === orderId).map((escrow) => publicEscrow(db, escrow, actor)),
       deliveries: db.deliveries
         .filter((item) => item.order_id === orderId)
@@ -941,15 +1034,27 @@ async function handle(req, res) {
   }
 
   if (req.method === "POST" && url.pathname === "/samples") {
-    const fullText = body.full_excerpt || body.excerpt || body.sample || "";
-    const protectedMode = Boolean(body.protected_preview || body.full_excerpt || body.visibility === "protected");
+    const fullText = body.full_excerpt || body.full_sample || body.draft || body.excerpt || body.sample || "";
+    const explicitPreview =
+      body.protected_preview_text ||
+      body.public_preview ||
+      (typeof body.protected_preview === "string" ? body.protected_preview : null);
+    const protectedMode = Boolean(
+      body.protected_preview === true ||
+      explicitPreview ||
+      body.full_excerpt ||
+      body.full_sample ||
+      body.visibility === "protected"
+    );
+    const publicPreview = protectedMode ? previewText(explicitPreview || body.excerpt || body.sample || fullText, 220) : fullText;
     const item = {
       id: id("sample"),
       at: new Date().toISOString(),
       actor,
       brief_id: body.brief_id || null,
-      excerpt: protectedMode ? previewText(body.protected_preview || fullText) : fullText,
+      excerpt: publicPreview,
       protected_preview: protectedMode,
+      preview_source: explicitPreview ? "protected_preview_text" : protectedMode ? "generated_from_submission" : "full_public_excerpt",
       full_excerpt_stored: protectedMode ? "withheld_until_funded_order" : null,
       price: body.price || null,
       terms: body.terms || null,
@@ -1214,6 +1319,7 @@ async function handle(req, res) {
       payee_addr: body.payee_addr || null,
       escrow_id: body.escrow_id || null,
       escrow_proof: body.escrow_proof || null,
+      delivery_due_at: body.delivery_due_at || body.due_at || body.deadline || null,
       deliverable: body.deliverable || body.outcome || "",
       raw: body,
       risk_flags,
@@ -1223,7 +1329,7 @@ async function handle(req, res) {
     writeDb(db);
     return send(res, 201, {
       ok: true,
-      order: item,
+      order: publicOrderSummary(db, item, actor),
       conversion_candidate: false,
       ui: ui(
         item.status === "funded" ? "Funded order recorded" : "Order needs trust proof",
@@ -1318,6 +1424,7 @@ async function handle(req, res) {
       excerpt: body.excerpt || previewText(body.draft || body.full_draft || "", 360) || null,
       private_notes: body.private_notes || null,
       revised_from_revision_id: body.revised_from_revision_id || null,
+      supersedes_delivery_id: body.supersedes_delivery_id || null,
       rights_transfer: body.rights_transfer || "after_acceptance_and_payment",
       notes: body.notes || "",
       raw: body,
@@ -1325,6 +1432,16 @@ async function handle(req, res) {
     };
     item.quality_evidence = deliveryQualityEvidence(item);
     db.deliveries.push(item);
+    if ((deliveryStatus === "submitted" || deliveryStatus === "revised") && item.supersedes_delivery_id) {
+      const prior = db.deliveries.find((delivery) =>
+        delivery.id === item.supersedes_delivery_id &&
+        delivery.order_id === item.order_id &&
+        actorIsWriter(order, delivery.actor)
+      );
+      if (prior && !verifiedAcceptanceForOrder(db, order, prior.id)) {
+        prior.status = `superseded_by_${item.id}`;
+      }
+    }
     writeDb(db);
     return send(res, 201, {
       ok: true,
