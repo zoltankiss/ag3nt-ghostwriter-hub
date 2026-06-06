@@ -300,6 +300,7 @@ function discovery() {
       { method: "GET", path: "/proposal-bridge", summary: "Publisher-safe bridge from native service interest to private proposal, escrowed order, delivery, acceptance, release/refund, and review gates." },
       { method: "POST", path: "/publisher-native-handoffs", summary: "ag3ntbook native action handoff into Ghostwriter workflow; accepted service handoffs return brief/proposal links plus diagnostic_checkout order draft. Body {handoff_type,role,public_context_summary,tags,buyer_brief,writer_reply,terms_ack}." },
       { method: "GET", path: "/publisher-native-handoffs", summary: "Audit public-safe native publisher handoffs and blocked reader/catalog handoffs." },
+      { method: "GET", path: "/publisher-handoff-quality", summary: "Audit native publisher handoff quality: routeable starts, weak/vague clicks, reader suppressions, downstream funded work, and feedback payloads." },
       { method: "GET", path: "/publisher-ad-guidance", summary: "Contextual publisher guidance for ag3ntbook/ag3ntads: which memoir offers can be served, where, and what must stay blocked." },
       { method: "POST", path: "/publisher-ad-decision", summary: "ag3ntbook/ag3ntads can submit a public placement context and get a serve/hold decision. Body {offer_type,placement_key,context_type,tags,public_context_summary}." },
       { method: "GET", path: "/publisher-ad-decisions", summary: "Audit public-safe contextual placement decisions. Filters: ?decision=request_ag3ntads_opportunity|do_not_request&offer_type=..." },
@@ -315,6 +316,7 @@ function discovery() {
       { method: "GET", path: "/publisher-handoff", label: "Publisher handoff" },
       { method: "GET", path: "/customer-start", label: "Customer start" },
       { method: "GET", path: "/proposal-bridge", label: "Proposal bridge" },
+      { method: "GET", path: "/publisher-handoff-quality", label: "Handoff quality" },
       { method: "GET", path: "/service-terms", label: "Service terms" },
       { method: "GET", path: "/catalog", label: "Browse catalog" },
       { method: "POST", path: "/profiles", label: "Create profile" },
@@ -1535,6 +1537,178 @@ function publisherNativeHandoffFeedbackPayloads(handoff, readiness) {
   ];
 }
 
+function handoffLinkedDownstreamState(db, handoff) {
+  const linkedBriefIds = new Set([
+    handoff.created_brief_id,
+    ...(handoff.linked_proposal_id
+      ? db.proposals.filter((proposal) => proposal.id === handoff.linked_proposal_id).map((proposal) => proposal.brief_id)
+      : [])
+  ].filter(Boolean));
+  const linkedProposalIds = new Set([
+    handoff.linked_proposal_id,
+    ...db.proposals
+      .filter((proposal) => proposal.raw?.publisher_handoff_id === handoff.id || linkedBriefIds.has(proposal.brief_id))
+      .map((proposal) => proposal.id)
+  ].filter(Boolean));
+  const linkedOrders = db.orders.filter((order) =>
+    linkedBriefIds.has(order.brief_id) ||
+    linkedProposalIds.has(order.proposal_id) ||
+    order.raw?.publisher_handoff_id === handoff.id
+  );
+  const fundedOrders = linkedOrders.filter((order) => Boolean(verifiedEscrowForOrder(db, order)));
+  const acceptedOrders = linkedOrders.filter((order) => Boolean(orderTrustState(db, order).accepted_delivery));
+  const releasedOrders = linkedOrders.filter((order) => Boolean(releasedEscrowForOrder(db, order)));
+  return {
+    linked_brief_ids: [...linkedBriefIds],
+    linked_proposal_ids: [...linkedProposalIds],
+    linked_order_count: linkedOrders.length,
+    verified_funded_order_count: fundedOrders.length,
+    accepted_delivery_count: acceptedOrders.length,
+    released_paid_order_count: releasedOrders.length,
+    funded_value: fundedOrders.reduce((sum, order) => sum + money(order.amount), 0),
+    downstream_conversion_state: releasedOrders.length
+      ? "released_paid_work"
+      : acceptedOrders.length
+        ? "accepted_delivery"
+        : fundedOrders.length
+          ? "verified_funded_order"
+          : linkedOrders.length
+            ? "order_started_awaiting_verified_escrow"
+            : handoff.status === "workflow_started"
+              ? "workflow_started_no_paid_conversion"
+              : "feedback_only"
+  };
+}
+
+function publicHandoffQualityExample(db, handoff) {
+  const downstream = handoffLinkedDownstreamState(db, handoff);
+  return {
+    id: handoff.id,
+    at: handoff.at,
+    source: handoff.source,
+    role: handoff.role,
+    requested_offer_type: handoff.requested_offer_type,
+    status: handoff.status,
+    decision: handoff.decision,
+    public_context_summary: handoff.public_context_summary,
+    tags: handoff.tags || [],
+    blocked_reasons: handoff.blocked_reasons || [],
+    signal: {
+      service_context_match: Boolean(handoff.signals?.service_context_match),
+      reader_context_match: Boolean(handoff.signals?.reader_context_match),
+      unsafe_or_private_context: Boolean(handoff.signals?.unsafe_or_private_context),
+      buyer_signal_ok: handoff.publisher_signal_requirements?.buyer_brief?.ok ?? null
+    },
+    downstream,
+    protected_private_details: true
+  };
+}
+
+function publisherHandoffQuality(db) {
+  const readiness = adReadiness(db);
+  const handoffs = db.publisher_handoffs.slice();
+  const started = handoffs.filter((handoff) => handoff.status === "workflow_started");
+  const blocked = handoffs.filter((handoff) => handoff.status === "not_pmf");
+  const readerBlocked = blocked.filter((handoff) =>
+    handoff.blocked_reasons?.includes("reader_or_catalog_handoff_blocked_until_reader_ads_ready") ||
+    handoff.signals?.reader_context_match
+  );
+  const weakBuyerSignals = blocked.filter((handoff) =>
+    (handoff.blocked_reasons || []).some((reason) =>
+      ["missing_public_safe_buyer_brief_summary", "placeholder_buyer_brief_summary", "handoff_context_not_memoir_service_relevant"].includes(reason)
+    )
+  );
+  const unsafeBlocked = blocked.filter((handoff) => handoff.signals?.unsafe_or_private_context);
+  const missingTerms = blocked.filter((handoff) =>
+    (handoff.blocked_reasons || []).some((reason) => reason.startsWith("missing_") && reason.endsWith("_ack"))
+  );
+  const downstreamStates = handoffs.map((handoff) => handoffLinkedDownstreamState(db, handoff));
+  const fundedFromHandoffs = downstreamStates.filter((state) => state.verified_funded_order_count > 0);
+  const acceptedFromHandoffs = downstreamStates.filter((state) => state.accepted_delivery_count > 0);
+  const releasedFromHandoffs = downstreamStates.filter((state) => state.released_paid_order_count > 0);
+  const reasons = blocked.flatMap((handoff) => handoff.blocked_reasons || []);
+  const reasonCounts = [...new Set(reasons)].map((reason) => ({
+    reason,
+    count: reasons.filter((candidate) => candidate === reason).length
+  })).sort((a, b) => b.count - a.count || a.reason.localeCompare(b.reason));
+  const qualityStatus =
+    !handoffs.length
+      ? "no_native_handoff_data_yet"
+      : fundedFromHandoffs.length
+        ? "handoffs_have_paid_downstream_evidence"
+        : started.length
+          ? "handoffs_started_but_no_paid_conversion_yet"
+          : "handoffs_are_feedback_only";
+  return {
+    updated_at: new Date().toISOString(),
+    purpose: "Give ag3ntbook and ag3ntads a public-safe signal about whether native handoffs are real workflow starts, weak clicks, blocked reader interest, or downstream paid conversion evidence.",
+    quality_status: qualityStatus,
+    pmf_policy: "Native handoffs are acquisition workflow starts only. They are not product-market fit or conversion evidence until a linked order has verified escrow, accepted delivery, released paid work, or ready ad attribution.",
+    counts: {
+      total_native_handoffs: handoffs.length,
+      workflow_started: started.length,
+      feedback_only_or_blocked: blocked.length,
+      buyer_workflows_started: started.filter((handoff) => handoff.role === "buyer").length,
+      writer_workflows_started: started.filter((handoff) => handoff.role === "writer").length,
+      reader_or_catalog_suppressed: readerBlocked.length,
+      weak_or_missing_buyer_signal: weakBuyerSignals.length,
+      unsafe_or_private_context_blocked: unsafeBlocked.length,
+      missing_terms_acknowledgement: missingTerms.length,
+      linked_verified_funded_handoffs: fundedFromHandoffs.length,
+      linked_accepted_delivery_handoffs: acceptedFromHandoffs.length,
+      linked_released_paid_handoffs: releasedFromHandoffs.length,
+      linked_funded_value: downstreamStates.reduce((sum, state) => sum + state.funded_value, 0)
+    },
+    reason_counts: reasonCounts,
+    publisher_action: {
+      ag3ntbook: started.length
+        ? "Keep routing only public memoir-service buyer/writer actions with full service-term acknowledgement; add verified escrow before showing success."
+        : "Do not treat generic clicks as starts. Improve native UI so buyer handoffs include a real public-safe memoir summary and all service acknowledgements.",
+      ag3ntads: readiness.service_ads.ready_to_test
+        ? "Service offer remains product-ready, but native handoff starts should not be counted as ad conversion unless linked downstream paid evidence appears."
+        : "Hold service ads and use missing service readiness plus handoff quality as publisher-serving feedback.",
+      reader_ads: readiness.reader_ads.ready_to_test
+        ? "Reader handoffs still need a separate reader campaign and exchange audit."
+        : "Suppress reader/catalog handoffs as feedback only until rights-cleared catalog, exact price/license, and verified paid read access exist."
+    },
+    required_next_evidence: [
+      "ag3ntbook native buyer handoff with public-safe memoir summary and all service terms acknowledgements",
+      "private proposal with payee wallet, exact milestone amount, acceptance criteria, privacy, revision, and rights terms",
+      "signed order with verified numeric chain escrow using the order id as ref",
+      "writer acknowledgement, substantive memoir delivery, acceptance/revision/dispute path, and release/refund result",
+      "ad attribution only after verified funded order or paid read-access event, depending on offer type"
+    ],
+    feedback_payloads: [
+      {
+        target: "ag3ntads",
+        method: "POST",
+        endpoint: `${AG3NTADS_URL}/feedback`,
+        body: {
+          sentiment: fundedFromHandoffs.length ? "positive" : started.length ? "mixed" : "negative",
+          type: "publisher_handoff_quality",
+          endpoint_context: "Ghostwriter Hub /publisher-handoff-quality",
+          message: fundedFromHandoffs.length
+            ? `Ghostwriter native handoffs have ${fundedFromHandoffs.length} linked verified funded downstream handoff(s). Continue counting only funded orders or released paid work as conversion evidence; reader/catalog handoffs remain offer-gated.`
+            : `Ghostwriter native handoffs have ${started.length} workflow start(s) but no linked verified funded order yet. Do not count native starts as PMF or ad conversion; reader/catalog handoffs remain blocked until /ad-readiness reader_ads is green.`
+        }
+      },
+      {
+        target: "ag3ntbook",
+        method: "POST",
+        endpoint: `${AG3NTBOOK_URL}/feedback`,
+        body: {
+          sentiment: weakBuyerSignals.length || readerBlocked.length ? "mixed" : "positive",
+          type: "native_handoff_quality",
+          endpoint_context: "Ghostwriter Hub /publisher-handoff-quality",
+          message: `Native handoff quality: ${started.length} workflow start(s), ${weakBuyerSignals.length} weak/vague buyer signal(s), ${readerBlocked.length} reader/catalog suppression(s), ${fundedFromHandoffs.length} linked funded downstream handoff(s). Route only public memoir-service actions with full terms acknowledgement; suppress reader/catalog until ready.`
+        }
+      }
+    ],
+    recent_public_safe_handoffs: handoffs.slice(-12).reverse().map((handoff) => publicHandoffQualityExample(db, handoff)),
+    readiness
+  };
+}
+
 function serviceTermsPacket() {
   return {
     offer: {
@@ -1607,6 +1781,7 @@ function serviceTermsReadinessPacket(db) {
       customer_start: "http://localhost:4501/customer-start",
       publisher_handoff: "http://localhost:4501/publisher-handoff",
       proposal_bridge: "http://localhost:4501/proposal-bridge",
+      handoff_quality: "http://localhost:4501/publisher-handoff-quality",
       readiness: "http://localhost:4501/ad-readiness",
       funded_conversion_evidence: "http://localhost:4501/ad-attributions"
     },
@@ -1792,6 +1967,11 @@ function publisherHandoff(db) {
         path: "http://localhost:4501/proposal-bridge",
         purpose: "Render the private proposal-to-escrow workflow before ag3ntbook routes a buyer/writer pair into terms negotiation."
       },
+      handoff_quality: {
+        method: "GET",
+        path: "http://localhost:4501/publisher-handoff-quality",
+        purpose: "Audit whether ag3ntbook native actions are routeable service starts, weak/vague clicks, blocked reader/catalog interest, or downstream paid conversion evidence."
+      },
       fund_order: {
         method: "POST",
         path: "http://localhost:4501/orders",
@@ -1913,6 +2093,12 @@ function customerStartPacket(db) {
         method: "GET",
         path: "http://localhost:4501/proposal-bridge",
         expected_success: "Returns public-safe proposal, escrow, delivery, acceptance, release/refund, and review steps for the publisher handoff."
+      },
+      handoff_quality: {
+        label: "Audit routed handoff quality",
+        method: "GET",
+        path: "http://localhost:4501/publisher-handoff-quality",
+        expected_success: "Separates native workflow starts from weak clicks, reader/catalog suppressions, missing acknowledgements, and downstream paid evidence."
       },
       buyer_memoir_service: {
         label: "Start protected memoir brief",
@@ -2167,6 +2353,7 @@ function proposalBridgePacket(db, actor = {}, filters = {}) {
       service_terms: "http://localhost:4501/service-terms",
       customer_start: "http://localhost:4501/customer-start",
       publisher_handoff: "http://localhost:4501/publisher-handoff",
+      handoff_quality: "http://localhost:4501/publisher-handoff-quality",
       proposals: "http://localhost:4501/proposals",
       orders: "http://localhost:4501/orders",
       milestones: "http://localhost:4501/milestones",
@@ -5578,6 +5765,14 @@ async function handle(req, res) {
         examples: ["?status=workflow_started", "?status=not_pmf", "?role=buyer", "?role=writer"]
       },
       ui: ui("Native publisher handoffs", "Audit ag3ntbook routed workflow starts separately from funded-order conversion evidence.")
+    });
+  }
+
+  if (req.method === "GET" && url.pathname === "/publisher-handoff-quality") {
+    writeDb(db);
+    return send(res, 200, {
+      ...publisherHandoffQuality(db),
+      ui: ui("Publisher handoff quality", "Use this to keep native ag3ntbook starts honest: weak clicks and reader/catalog probes are feedback, while paid evidence requires verified downstream orders.")
     });
   }
 
