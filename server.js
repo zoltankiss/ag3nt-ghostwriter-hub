@@ -286,6 +286,7 @@ function discovery() {
       { method: "GET", path: "/order-declines", summary: "Browse declined escrow-bait orders; private reasons are protected." },
       { method: "GET", path: "/ad-readiness", summary: "Advertiser and publisher readiness decision for service vs reader offers. Use before launching ag3ntads campaigns." },
       { method: "GET", path: "/ad-campaign-plan", summary: "Launch/no-launch ad plan derived from readiness and feedback. Includes contextual service placement guidance and reader-ad suppression feedback payloads." },
+      { method: "GET", path: "/acquisition-launch-packet", summary: "Operator checklist for the next ag3ntads/ag3ntbook acquisition action. Includes campaign draft, readiness payload, publisher context rules, and blocked reader-ad feedback." },
       { method: "GET", path: "/publisher-ad-guidance", summary: "Contextual publisher guidance for ag3ntbook/ag3ntads: which memoir offers can be served, where, and what must stay blocked." },
       { method: "GET", path: "/ad-attributions", summary: "Verified funded-order ad conversions ready for advertiser-signed ag3ntads attestation." },
       { method: "GET", path: "/activity", summary: "Recent signed usage, feedback, orders, and product learning signals." },
@@ -631,6 +632,68 @@ function adCampaignPlan(db) {
       }
     ],
     readiness
+  };
+}
+
+function acquisitionLaunchPacket(db) {
+  const plan = adCampaignPlan(db);
+  const guidance = publisherAdGuidance(db);
+  const serviceTest = plan.launchable_tests.find((test) => test.offer_type === "memoir_ghostwriting_service") || null;
+  const readerBlock = plan.blocked_tests.find((test) => test.offer_type === "memoir_ebook_sales") || null;
+  const serviceCreativeText = serviceTest
+    ? `${serviceTest.creative.title}. ${serviceTest.creative.body} CTA: ${serviceTest.creative.cta}.`
+    : null;
+  const serviceCampaignDraft = serviceTest ? {
+    method: "POST",
+    endpoint: "http://localhost:4001/ads/campaigns",
+    body: {
+      offer_type: serviceTest.offer_type,
+      creative: serviceCreativeText,
+      creative_components: serviceTest.creative,
+      mvp_url: serviceTest.creative.mvp_url,
+      budget: 25,
+      per_click: 1
+    },
+    after_create: [
+      "Deposit the campaign budget with the ag3ntads operator before expecting active serving.",
+      "POST the service readiness payload to /ads/campaigns/:id/readiness.",
+      "Serve only through ag3ntbook contextual placements matching /publisher-ad-guidance."
+    ]
+  } : null;
+  return {
+    updated_at: new Date().toISOString(),
+    decision: serviceTest ? "launch_service_contextual_test_only" : "hold_all_ads",
+    source_of_truth: {
+      readiness: "http://localhost:4501/ad-readiness",
+      campaign_plan: "http://localhost:4501/ad-campaign-plan",
+      publisher_guidance: "http://localhost:4501/publisher-ad-guidance",
+      conversion_attestations: "http://localhost:4501/ad-attributions"
+    },
+    operator_next_actions: [
+      ...(serviceCampaignDraft ? [
+        "Create one memoir_ghostwriting_service ag3ntads campaign from service_campaign_draft.",
+        "Attach ag3ntads_readiness_payloads.memoir_ghostwriting_service to the campaign readiness endpoint.",
+        "Ask ag3ntbook to request opportunities only in relevant memoir, family-history, writing-help, paid-brief, escrow, or creator-service contexts."
+      ] : [
+        "Do not create a campaign until service_ads.ready_to_test is true."
+      ]),
+      ...(readerBlock ? [
+        "Do not create memoir_ebook_sales campaigns until reader_ads.ready_to_test is true."
+      ] : [])
+    ],
+    service_campaign_draft: serviceCampaignDraft,
+    service_readiness_payload: plan.ag3ntads_campaign_readiness_payloads.memoir_ghostwriting_service,
+    publisher_context_rules: guidance.ag3ntbook_context_rules,
+    conversion_policy: {
+      service_event: "verified_funded_order",
+      attest_from: "http://localhost:4501/ad-attributions",
+      reader_event: "verified_paid_read_access",
+      reader_status: readerBlock ? "blocked" : "ready",
+      rule: "Treat service and reader offers independently; service readiness never unlocks reader/catalog serving."
+    },
+    blocked_reader_campaign: readerBlock || null,
+    feedback_payloads_to_file: plan.feedback_payloads,
+    readiness_snapshot: plan.readiness
   };
 }
 
@@ -3844,6 +3907,14 @@ async function handle(req, res) {
     return send(res, 200, {
       ...adCampaignPlan(db),
       ui: ui("Ad campaign plan", "Launch only service tests in contextual ag3ntbook placements; keep reader ads blocked until catalog and paid read access are verified.")
+    });
+  }
+
+  if (req.method === "GET" && url.pathname === "/acquisition-launch-packet") {
+    writeDb(db);
+    return send(res, 200, {
+      ...acquisitionLaunchPacket(db),
+      ui: ui("Acquisition launch packet", "Use this to create one contextual service campaign and keep reader ads blocked.")
     });
   }
 
