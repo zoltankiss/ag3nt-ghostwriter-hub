@@ -36,6 +36,7 @@ const initialDb = {
   publication_consents: [],
   reader_purchases: [],
   reader_reviews: [],
+  reader_earnings: [],
   order_declines: [],
   order_acknowledgements: [],
   ad_attributions: [],
@@ -274,6 +275,7 @@ function discovery() {
       { method: "GET", path: "/catalog", summary: "Browse rights-cleared memoir previews. Public previews are short and non-reusable." },
       { method: "POST", path: "/reader-purchases", summary: "Signed chain payer buys access to a listed memoir publication. Body {publication_id,escrow_id,amount,payer_addr,payee_addr,ad_campaign_id}." },
       { method: "GET", path: "/reader-purchases", summary: "Signed readers can view their paid read-access purchases; verified status requires the signed wallet to match the chain payer." },
+      { method: "GET", path: "/reader-earnings", summary: "Browse public-safe earnings ledger for verified reader purchases. Filters: ?publication_id=...&writer_addr=...&rights_holder_addr=..." },
       { method: "GET", path: "/catalog/:id/read", summary: "Signed readers with verified payment can read the full licensed memoir material." },
       { method: "POST", path: "/reader-reviews", summary: "Verified reader review after paid read access. Body {publication_id,reader_purchase_id,rating,message,public_blurb,would_buy_more}. Public proof uses public_blurb when provided; private message wording is hidden from non-participants." },
       { method: "GET", path: "/reader-reviews", summary: "Browse verified post-purchase reader reviews without exposing full memoir text." },
@@ -322,6 +324,7 @@ function publicActivity(db, actor = {}) {
       publication_consents: db.publication_consents.length,
       reader_purchases: db.reader_purchases.length,
       reader_reviews: db.reader_reviews.length,
+      reader_earnings: db.reader_earnings.length,
       order_declines: db.order_declines.length,
       order_acknowledgements: db.order_acknowledgements.length,
       ad_attributions: db.ad_attributions.length,
@@ -339,9 +342,11 @@ function publicActivity(db, actor = {}) {
       verified_reader_reviews: db.reader_reviews.filter((review) => review.status === "verified_reader_review").length,
       protected_paid_reader_reviews: db.reader_reviews.filter((review) => review.status === "verified_reader_review_private_quote_blocked").length,
       reader_revenue: db.reader_purchases.reduce((sum, purchase) => sum + (purchase.status === "verified_paid_read_access" ? Number(purchase.amount || 0) : 0), 0),
+      writer_reader_royalties: db.reader_earnings.reduce((sum, earning) => sum + (earning.status === "earned_from_verified_reader_purchase" ? Number(earning.writer_royalty || 0) : 0), 0),
+      rights_holder_reader_earnings: db.reader_earnings.reduce((sum, earning) => sum + (earning.status === "earned_from_verified_reader_purchase" ? Number(earning.rights_holder_earnings || 0) : 0), 0),
       platform_fees: [
         ...db.orders.map((order) => orderTrustState(db, order).released_escrow ? Number(order.platform_fee || 0) : 0),
-        ...db.reader_purchases.map((purchase) => purchase.status === "verified_paid_read_access" ? Number(purchase.platform_fee || 0) : 0)
+        ...db.reader_earnings.map((earning) => earning.status === "earned_from_verified_reader_purchase" ? Number(earning.platform_fee || 0) : 0)
       ].reduce((sum, value) => sum + value, 0),
       ad_click_to_funded_order: db.ad_attributions.filter((attribution) => attribution.status === "ready_to_attest").length,
       ad_click_to_funded_read: db.ad_attributions.filter((attribution) => attribution.status === "ready_to_attest_reader_purchase").length
@@ -366,6 +371,7 @@ function publicActivity(db, actor = {}) {
     recent_publication_consents: db.publication_consents.slice(-10).reverse().map((consent) => publicPublicationConsent(db, consent, actor)),
     recent_reader_purchases: db.reader_purchases.slice(-10).reverse().map((purchase) => publicReaderPurchase(db, purchase, actor)),
     recent_reader_reviews: db.reader_reviews.slice(-10).reverse().map((review) => publicReaderReview(db, review, actor)),
+    recent_reader_earnings: db.reader_earnings.slice(-10).reverse().map((earning) => publicReaderEarning(db, earning, actor)),
     recent_order_acknowledgements: db.order_acknowledgements.slice(-10).reverse().map((ack) => publicOrderArtifact(db, ack, actor)),
     recent_ad_attributions: db.ad_attributions.slice(-10).reverse(),
     recent_requests: db.requests.slice(-20).reverse().map((request) => publicRequest(request, actor))
@@ -921,7 +927,7 @@ function reconcileOrderTrust(db) {
   }
 
   for (const consent of db.publication_consents) {
-    const decision = publicationConsentDecision(db, consent.raw || consent, consent.actor);
+    const decision = publicationConsentDecision(db, { ...(consent.raw || {}), ...consent }, consent.actor);
     const isDenial = consent.reader_sales_consent !== true;
     const signedWriterCanControlPublication = Boolean(decision.order && decision.delivery && actorIsWriter(decision.order, consent.actor));
     consent.verification_failures = decision.failures;
@@ -1000,6 +1006,20 @@ function reconcileOrderTrust(db) {
     purchase.status = publication?.status === "listed" && purchase.chain_escrow && fundedLike && !purchase.verification_failures?.length
       ? "verified_paid_read_access"
       : "awaiting_verified_reader_payment";
+    if (purchase.status === "verified_paid_read_access") {
+      const split = readerEarningSplit(publication, purchase.amount);
+      purchase.platform_fee = split.platform_fee;
+      purchase.writer_royalty = split.writer_royalty;
+      purchase.rights_holder_earnings = split.rights_holder_earnings;
+      upsertReaderEarning(db, purchase, publication);
+    } else {
+      purchase.platform_fee = 0;
+      purchase.writer_royalty = 0;
+      purchase.rights_holder_earnings = 0;
+      for (const earning of db.reader_earnings.filter((candidate) => candidate.reader_purchase_id === purchase.id)) {
+        earning.status = "blocked_unverified_reader_purchase";
+      }
+    }
   }
 
   for (const review of db.reader_reviews) {
@@ -1116,6 +1136,54 @@ function recordReaderAdAttribution(db, purchase, publication, body) {
     }
   };
   db.ad_attributions.push(item);
+  return item;
+}
+
+function money(value) {
+  const numeric = Number(value || 0);
+  return Number.isFinite(numeric) ? Math.max(0, Math.round(numeric * 100) / 100) : 0;
+}
+
+function readerEarningSplit(publication, amountValue) {
+  const amount = money(amountValue);
+  const publishedPrice = money(publication?.price);
+  const denominator = publishedPrice > 0 ? publishedPrice : amount || 1;
+  const platformFee = money(amount * (money(publication?.platform_fee) / denominator));
+  const writerRoyalty = money(amount * (money(publication?.writer_royalty) / denominator));
+  const rightsHolderEarnings = money(amount - platformFee - writerRoyalty);
+  return {
+    amount,
+    platform_fee: platformFee,
+    writer_royalty: writerRoyalty,
+    rights_holder_earnings: rightsHolderEarnings,
+    split_policy: "Reader purchase proceeds follow the listed publication split: platform fee, writer royalty, then rights-holder share."
+  };
+}
+
+function upsertReaderEarning(db, purchase, publication) {
+  if (!purchase?.id || purchase.status !== "verified_paid_read_access" || !publication) return null;
+  const split = readerEarningSplit(publication, purchase.amount);
+  const existing = db.reader_earnings.find((earning) => earning.reader_purchase_id === purchase.id);
+  const item = existing || {
+    id: id("readearn"),
+    at: new Date().toISOString(),
+    reader_purchase_id: purchase.id
+  };
+  Object.assign(item, {
+    updated_at: new Date().toISOString(),
+    publication_id: publication.id,
+    reader_addr: purchase.actor?.address || purchase.payer_addr || null,
+    rights_holder_addr: publication.rights_holder_addr || purchase.payee_addr || null,
+    writer_addr: publication.writer_addr || null,
+    escrow_id: purchase.escrow_id || null,
+    amount: split.amount,
+    platform_fee: split.platform_fee,
+    writer_royalty: split.writer_royalty,
+    rights_holder_earnings: split.rights_holder_earnings,
+    split_policy: split.split_policy,
+    status: "earned_from_verified_reader_purchase"
+  });
+  if (!existing) db.reader_earnings.push(item);
   return item;
 }
 
@@ -1642,6 +1710,20 @@ function publicPublication(db, publication, actor = {}) {
     paid_reader_reviews: db.reader_reviews.filter((review) => review.publication_id === publication.id && review.status === "verified_reader_review").length,
     protected_reader_reviews: db.reader_reviews.filter((review) => review.publication_id === publication.id && review.status === "verified_reader_review_private_quote_blocked").length,
     paid_reader_purchases: db.reader_purchases.filter((purchase) => purchase.publication_id === publication.id && purchase.status === "verified_paid_read_access").length,
+    reader_earnings: {
+      revenue: db.reader_earnings
+        .filter((earning) => earning.publication_id === publication.id && earning.status === "earned_from_verified_reader_purchase")
+        .reduce((sum, earning) => sum + Number(earning.amount || 0), 0),
+      platform_fees: db.reader_earnings
+        .filter((earning) => earning.publication_id === publication.id && earning.status === "earned_from_verified_reader_purchase")
+        .reduce((sum, earning) => sum + Number(earning.platform_fee || 0), 0),
+      writer_royalties: db.reader_earnings
+        .filter((earning) => earning.publication_id === publication.id && earning.status === "earned_from_verified_reader_purchase")
+        .reduce((sum, earning) => sum + Number(earning.writer_royalty || 0), 0),
+      rights_holder_earnings: db.reader_earnings
+        .filter((earning) => earning.publication_id === publication.id && earning.status === "earned_from_verified_reader_purchase")
+        .reduce((sum, earning) => sum + Number(earning.rights_holder_earnings || 0), 0)
+    },
     full_text: canViewFull ? delivery?.draft || delivery?.excerpt || null : undefined,
     read_access: canViewFull ? "verified_access_or_owner" : "purchase_required",
     status: publication.status,
@@ -1725,8 +1807,38 @@ function publicReaderPurchase(db, purchase, actor = {}) {
     chain_escrow: canViewFull ? chain_escrow : chain_escrow ? { id: chain_escrow.id, amount: chain_escrow.amount, status: chain_escrow.status, ref: chain_escrow.ref } : undefined,
     raw: canViewFull ? raw : undefined,
     read_path: purchase.status === "verified_paid_read_access" && canViewFull ? `/catalog/${purchase.publication_id}/read` : null,
+    earnings_ledger_path: purchase.status === "verified_paid_read_access" ? `/reader-earnings?publication_id=${purchase.publication_id}` : null,
     payment_claim_policy: "Read access, reader revenue, reader reviews, and ad attribution count only when the chain payer signs the purchase claim.",
     protected_private_details: !canViewFull
+  };
+}
+
+function publicReaderEarning(db, earning, actor = {}) {
+  const publication = db.publications.find((candidate) => candidate.id === earning.publication_id);
+  const canViewFinancialCounterparty = actor?.signed && (
+    isSameAddress(actor.address, earning.reader_addr) ||
+    isSameAddress(actor.address, earning.rights_holder_addr) ||
+    isSameAddress(actor.address, earning.writer_addr)
+  );
+  return {
+    id: earning.id,
+    at: earning.at,
+    updated_at: earning.updated_at || earning.at,
+    publication_id: earning.publication_id,
+    reader_purchase_id: earning.reader_purchase_id,
+    escrow_id: canViewFinancialCounterparty ? earning.escrow_id : earning.escrow_id ? "verified_chain_escrow" : null,
+    title: publication?.title || null,
+    amount: earning.amount,
+    platform_fee: earning.platform_fee,
+    writer_royalty: earning.writer_royalty,
+    rights_holder_earnings: earning.rights_holder_earnings,
+    reader_addr: canViewFinancialCounterparty ? earning.reader_addr : "withheld_from_public_ledger",
+    writer_addr: earning.writer_addr,
+    rights_holder_addr: earning.rights_holder_addr,
+    status: earning.status,
+    split_policy: earning.split_policy,
+    privacy_policy: "The reader earnings ledger shows money movement and rights parties only; no full draft, reader private message, or memoir detail is exposed.",
+    protected_private_details: !canViewFinancialCounterparty
   };
 }
 
@@ -3018,7 +3130,7 @@ async function handle(req, res) {
     const verificationFailures = [...match.failures, ...actorFailures];
     const verified = Boolean(publication?.status === "listed" && chainEscrow && ["locked", "submitted", "released"].includes(chainStatus) && !verificationFailures.length);
     const amount = Number(body.amount || publication?.price || 0);
-    const platformFee = verified ? Math.max(0, Math.round(amount * 0.15 * 100) / 100) : 0;
+    const split = verified ? readerEarningSplit(publication, amount) : readerEarningSplit(null, 0);
     const item = {
       id: id("readbuy"),
       at: new Date().toISOString(),
@@ -3028,8 +3140,9 @@ async function handle(req, res) {
       payer_addr: body.payer_addr || actor.address || null,
       payee_addr: body.payee_addr || publication?.payee_addr || null,
       amount: Number.isFinite(amount) ? amount : null,
-      platform_fee: platformFee,
-      rights_holder_earnings: verified ? Math.max(0, Math.round((amount - platformFee) * 100) / 100) : 0,
+      platform_fee: split.platform_fee,
+      writer_royalty: split.writer_royalty,
+      rights_holder_earnings: split.rights_holder_earnings,
       proof: body.proof || null,
       chain_escrow: chainEscrow,
       verification_failures: verificationFailures,
@@ -3037,7 +3150,10 @@ async function handle(req, res) {
       status: verified ? "verified_paid_read_access" : "awaiting_verified_reader_payment"
     };
     db.reader_purchases.push(item);
-    if (verified) recordReaderAdAttribution(db, item, publication, body);
+    if (verified) {
+      upsertReaderEarning(db, item, publication);
+      recordReaderAdAttribution(db, item, publication, body);
+    }
     writeDb(db);
     return send(res, 201, {
       ok: verified,
@@ -3060,6 +3176,37 @@ async function handle(req, res) {
     return send(res, 200, {
       reader_purchases: purchases.map((purchase) => publicReaderPurchase(db, purchase, actor)),
       ui: ui("Reader purchases", "Verified purchases unlock read access and reader review eligibility only when the signed reader wallet matches the chain payer.")
+    });
+  }
+
+  if (req.method === "GET" && url.pathname === "/reader-earnings") {
+    let earnings = db.reader_earnings.slice();
+    const publicationFilter = url.searchParams.get("publication_id");
+    const writerFilter = url.searchParams.get("writer_addr");
+    const rightsHolderFilter = url.searchParams.get("rights_holder_addr");
+    const statusFilter = url.searchParams.get("status");
+    if (publicationFilter) earnings = earnings.filter((earning) => earning.publication_id === publicationFilter);
+    if (writerFilter) earnings = earnings.filter((earning) => isSameAddress(earning.writer_addr, writerFilter));
+    if (rightsHolderFilter) earnings = earnings.filter((earning) => isSameAddress(earning.rights_holder_addr, rightsHolderFilter));
+    if (statusFilter) earnings = earnings.filter((earning) => earning.status === statusFilter);
+    const verifiedEarnings = earnings.filter((earning) => earning.status === "earned_from_verified_reader_purchase");
+    writeDb(db);
+    return send(res, 200, {
+      reader_earnings: earnings.map((earning) => publicReaderEarning(db, earning, actor)),
+      summary: {
+        verified_reader_purchase_count: verifiedEarnings.length,
+        reader_revenue: verifiedEarnings.reduce((sum, earning) => sum + Number(earning.amount || 0), 0),
+        platform_fees: verifiedEarnings.reduce((sum, earning) => sum + Number(earning.platform_fee || 0), 0),
+        writer_royalties: verifiedEarnings.reduce((sum, earning) => sum + Number(earning.writer_royalty || 0), 0),
+        rights_holder_earnings: verifiedEarnings.reduce((sum, earning) => sum + Number(earning.rights_holder_earnings || 0), 0)
+      },
+      filters: {
+        publication_id: publicationFilter,
+        writer_addr: writerFilter,
+        rights_holder_addr: rightsHolderFilter,
+        status: statusFilter
+      },
+      ui: ui("Reader earnings", "Verified paid read access creates a public-safe earnings ledger without exposing memoir text or private reader feedback.")
     });
   }
 
