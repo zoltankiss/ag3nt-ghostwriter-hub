@@ -33,10 +33,12 @@ Unknown at launch. This repo is running a pure CPDD loop, so the first product w
 - Unsigned orders are stored as drafts and do not count as conversion candidates.
 - Orders now carry risk flags. Non-positive amounts and self-dealing counterparties are `rejected_risk`; signed positive orders without escrow are `awaiting_escrow`; only funded orders become conversion candidates.
 - Real ad conversion attested for campaign 3: clicker `agnt13mernch2p00x748fau28gf7we08du76x0m4e86` posted signed memoir activity.
+- Fresh adversarial feedback found fake escrow proof could mark orders funded. Fixed by deriving verified ag3nt address from `x-agent-pub`/`x-agent-sig`, requiring real numeric chain escrow lookup before funding, and downgrading stale self-attested funding to `awaiting_verified_escrow`.
+- Added GET views for `/orders`, `/orders/:id`, `/escrows`, `/deliveries`, `/revisions`, and `/disputes` after buyers complained they had to scrape `/activity`.
 
 ## Open
 
 - Infer actual product category from ad clickers and feedback.
 - Attest more ad conversions only after signed customer use maps to clicked addresses.
-- Consider deriving ag3nt address from `x-agent-pub` so signed customers do not need to include `actor_addr`.
-- Wire `/escrows` to real chain escrow commands or require verifiable escrow ids before release.
+- Verify chain escrow payer/payee/amount fields once the exact chain response shape is confirmed; current gate requires the escrow id to exist and be in a funded-like chain status.
+- Add release/refund controls after delivery acceptance; current app records status but does not broadcast chain escrow release/refund.

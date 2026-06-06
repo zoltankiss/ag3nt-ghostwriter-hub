@@ -4,8 +4,13 @@ const path = require("path");
 const crypto = require("crypto");
 
 const PORT = Number(process.env.PORT || 4501);
+const CHAIN_API = process.env.AG3NT_CHAIN_API || "http://localhost:1317";
 const DATA_DIR = path.join(__dirname, "data");
 const DB_PATH = path.join(DATA_DIR, "db.json");
+const AGNT_ADDR = /^agnt1[0-9a-z]{38}$/;
+const BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+const BECH32_GEN = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
+const ED_SPKI_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
 
 const initialDb = {
   created_at: new Date().toISOString(),
@@ -50,6 +55,80 @@ function id(prefix) {
   return `${prefix}_${crypto.randomBytes(5).toString("hex")}`;
 }
 
+function polymod(values) {
+  let chk = 1;
+  for (const value of values) {
+    const top = chk >>> 25;
+    chk = ((chk & 0x1ffffff) << 5) ^ value;
+    for (let i = 0; i < 5; i++) if ((top >> i) & 1) chk ^= BECH32_GEN[i];
+  }
+  return chk;
+}
+
+function hrpExpand(hrp) {
+  const out = [];
+  for (let i = 0; i < hrp.length; i++) out.push(hrp.charCodeAt(i) >> 5);
+  out.push(0);
+  for (let i = 0; i < hrp.length; i++) out.push(hrp.charCodeAt(i) & 31);
+  return out;
+}
+
+function convertBits(data, from, to, pad) {
+  let acc = 0;
+  let bits = 0;
+  const out = [];
+  const maxv = (1 << to) - 1;
+  for (const byte of data) {
+    acc = (acc << from) | byte;
+    bits += from;
+    while (bits >= to) {
+      bits -= to;
+      out.push((acc >> bits) & maxv);
+    }
+  }
+  if (pad && bits > 0) out.push((acc << (to - bits)) & maxv);
+  return out;
+}
+
+function toBech32(hrp, bytes) {
+  const data = convertBits([...bytes], 8, 5, true);
+  const checksumSeed = hrpExpand(hrp).concat(data).concat([0, 0, 0, 0, 0, 0]);
+  const mod = polymod(checksumSeed) ^ 1;
+  const checksum = [];
+  for (let p = 0; p < 6; p++) checksum.push((mod >> (5 * (5 - p))) & 31);
+  return hrp + "1" + data.concat(checksum).map((v) => BECH32_CHARSET[v]).join("");
+}
+
+function addressFromPub(pubBase64) {
+  const rawPub = Buffer.from(String(pubBase64), "base64");
+  if (rawPub.length !== 32) return null;
+  const digest = crypto.createHash("sha256").update(rawPub).digest().slice(0, 20);
+  return toBech32("agnt", digest);
+}
+
+function verifySignedRequest(req, rawBody) {
+  const pub = req.headers["x-agent-pub"];
+  const nonce = req.headers["x-agent-nonce"];
+  const sig = req.headers["x-agent-sig"];
+  if (!pub || !nonce || !sig) return { signed: false };
+  try {
+    const rawPub = Buffer.from(String(pub), "base64");
+    const sigBuf = Buffer.from(String(sig), "base64");
+    const key = crypto.createPublicKey({
+      key: Buffer.concat([ED_SPKI_PREFIX, rawPub]),
+      format: "der",
+      type: "spki"
+    });
+    const bodyHash = crypto.createHash("sha256").update(rawBody || Buffer.alloc(0)).digest("hex");
+    const canonical = ["ag3nt-req:v1", req.method.toUpperCase(), new URL(req.url, "http://local").pathname, bodyHash, String(nonce)].join("\n");
+    const ok = crypto.verify(null, Buffer.from(canonical, "utf8"), key, sigBuf);
+    const address = ok ? addressFromPub(pub) : null;
+    return ok && address ? { signed: true, address, auth_error: null } : { signed: false, auth_error: "signature_failed" };
+  } catch (err) {
+    return { signed: false, auth_error: err.message };
+  }
+}
+
 function send(res, status, body) {
   res.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
@@ -62,25 +141,30 @@ function send(res, status, body) {
 
 function readBody(req) {
   return new Promise((resolve) => {
-    let raw = "";
+    const chunks = [];
+    let size = 0;
     req.on("data", (chunk) => {
-      raw += chunk;
-      if (raw.length > 1_000_000) req.destroy();
+      chunks.push(chunk);
+      size += chunk.length;
+      if (size > 1_000_000) req.destroy();
     });
     req.on("end", () => {
-      if (!raw) return resolve({});
+      const raw = Buffer.concat(chunks);
+      if (!raw.length) return resolve({ body: {}, raw });
       try {
-        resolve(JSON.parse(raw));
+        resolve({ body: JSON.parse(raw.toString("utf8")), raw });
       } catch {
-        resolve({ _raw: raw });
+        resolve({ body: { _raw: raw.toString("utf8") }, raw });
       }
     });
   });
 }
 
-function actorFrom(req, body = {}) {
+function actorFrom(req, body = {}, rawBody = Buffer.alloc(0)) {
   const headers = req.headers;
+  const verified = verifySignedRequest(req, rawBody);
   const address =
+    verified.address ||
     headers["x-agent-addr"] ||
     headers["x-agent-address"] ||
     headers["x-ag3nt-address"] ||
@@ -96,15 +180,21 @@ function actorFrom(req, body = {}) {
     address,
     pubkey_fingerprint,
     agent_id: headers["x-agent-id"] || headers["user-agent"] || "unknown",
-    signed: Boolean(
-      address ||
-      pubkey ||
-      headers["x-agent-sig"] ||
-      headers["x-signature"] ||
-      headers["x-ag3nt-signature"] ||
-      headers["authorization"]
-    )
+    signed: Boolean(verified.signed),
+    auth_error: verified.auth_error || null
   };
+}
+
+async function getChainEscrow(escrowId) {
+  if (!escrowId || !/^\d+$/.test(String(escrowId))) return null;
+  try {
+    const response = await fetch(`${CHAIN_API}/zoltankiss/agntcoin/agntcoin/v1/escrow/${escrowId}`);
+    if (!response.ok) return null;
+    const body = await response.json();
+    return body.escrow || body.Escrow || null;
+  } catch {
+    return null;
+  }
 }
 
 function ui(label, description, actions = []) {
@@ -198,9 +288,10 @@ function notFound(req, res) {
 async function handle(req, res) {
   if (req.method === "OPTIONS") return send(res, 204, {});
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
-  const body = req.method === "POST" ? await readBody(req) : {};
+  const parsed = req.method === "POST" ? await readBody(req) : { body: {}, raw: Buffer.alloc(0) };
+  const body = parsed.body;
   const db = readDb();
-  const actor = actorFrom(req, body);
+  const actor = actorFrom(req, body, parsed.raw);
   db.requests.push({
     id: id("req"),
     at: new Date().toISOString(),
@@ -262,6 +353,33 @@ async function handle(req, res) {
     return send(res, 200, {
       intents: db.intents,
       ui: ui("Customer demand", "Post /intents if your job is missing.")
+    });
+  }
+
+  if (req.method === "GET" && url.pathname === "/orders") {
+    writeDb(db);
+    return send(res, 200, {
+      orders: db.orders,
+      ui: ui("Orders", "Funded orders have chain-verified escrow ids.")
+    });
+  }
+
+  if (req.method === "GET" && url.pathname.startsWith("/orders/")) {
+    const orderId = url.pathname.split("/")[2];
+    const order = db.orders.find((item) => item.id === orderId);
+    if (!order) {
+      writeDb(db);
+      return send(res, 404, { error: "order_not_found", ui: ui("Order not found", "Use GET /orders.") });
+    }
+    writeDb(db);
+    return send(res, 200, {
+      order,
+      escrows: db.escrows.filter((item) => item.order_id === orderId),
+      deliveries: db.deliveries.filter((item) => item.order_id === orderId),
+      revisions: db.revisions.filter((item) => item.order_id === orderId),
+      disputes: db.disputes.filter((item) => item.order_id === orderId),
+      reviews: db.reviews.filter((item) => item.order_id === orderId),
+      ui: ui("Order status", "Review escrow, delivery, revision, dispute, and review state from one place.")
     });
   }
 
@@ -523,6 +641,9 @@ async function handle(req, res) {
   }
 
   if (req.method === "POST" && url.pathname === "/escrows") {
+    const chainEscrow = await getChainEscrow(body.escrow_id || body.chain_escrow_id);
+    const chainStatus = chainEscrow && String(chainEscrow.status || "").toLowerCase();
+    const chainFunded = Boolean(chainEscrow && ["locked", "submitted", "released"].includes(chainStatus));
     const item = {
       id: id("escrow"),
       at: new Date().toISOString(),
@@ -532,13 +653,14 @@ async function handle(req, res) {
       payer_addr: body.payer_addr || actor.address || null,
       payee_addr: body.payee_addr || null,
       amount: body.amount || null,
-      status: body.status || "claimed_funded",
+      status: chainFunded ? chainStatus : "unverified",
       proof: body.proof || null,
+      chain_escrow: chainEscrow,
       raw: body
     };
     db.escrows.push(item);
     const order = db.orders.find((candidate) => candidate.id === item.order_id);
-    if (order && actor.signed && item.escrow_id && item.payee_addr && Number(item.amount) > 0) {
+    if (order && actor.signed && chainFunded && item.escrow_id && item.payee_addr && Number(item.amount) > 0) {
       order.status = "funded";
       order.escrow_id = item.escrow_id;
       order.payee_addr = item.payee_addr;
@@ -552,14 +674,27 @@ async function handle(req, res) {
           order_id: order.id
         });
       }
+    } else if (order) {
+      const hasVerifiedEscrow = db.escrows.some((candidate) =>
+        candidate.order_id === order.id &&
+        candidate.chain_escrow &&
+        ["locked", "submitted", "released"].includes(String(candidate.status || "").toLowerCase())
+      );
+      order.status = hasVerifiedEscrow ? "funded" : "awaiting_verified_escrow";
+      order.risk_flags = Array.from(new Set([...(order.risk_flags || []), "unverified_escrow"]));
     }
     writeDb(db);
     return send(res, 201, {
       ok: true,
       escrow: item,
       order,
-      ui: ui("Escrow status recorded", "Funded orders can proceed to delivery.")
+      ui: ui(chainFunded ? "Escrow verified" : "Escrow not verified", chainFunded ? "Funded orders can proceed to delivery." : "Provide a real numeric chain escrow id before this order counts as funded.")
     });
+  }
+
+  if (req.method === "GET" && url.pathname === "/escrows") {
+    writeDb(db);
+    return send(res, 200, { escrows: db.escrows, ui: ui("Escrows", "Only chain-verified escrows fund orders.") });
   }
 
   if (req.method === "POST" && url.pathname === "/deliveries") {
@@ -589,6 +724,11 @@ async function handle(req, res) {
     });
   }
 
+  if (req.method === "GET" && url.pathname === "/deliveries") {
+    writeDb(db);
+    return send(res, 200, { deliveries: db.deliveries, ui: ui("Deliveries", "Use /orders/:id for order-specific status.") });
+  }
+
   if (req.method === "POST" && url.pathname === "/revisions") {
     const item = {
       id: id("revision"),
@@ -607,6 +747,11 @@ async function handle(req, res) {
       revision: item,
       ui: ui("Revision requested", "The request is now attached to the order.")
     });
+  }
+
+  if (req.method === "GET" && url.pathname === "/revisions") {
+    writeDb(db);
+    return send(res, 200, { revisions: db.revisions, ui: ui("Revisions", "Use /orders/:id for order-specific status.") });
   }
 
   if (req.method === "POST" && url.pathname === "/disputes") {
@@ -629,7 +774,14 @@ async function handle(req, res) {
     });
   }
 
+  if (req.method === "GET" && url.pathname === "/disputes") {
+    writeDb(db);
+    return send(res, 200, { disputes: db.disputes, ui: ui("Disputes", "Open refund or quality concerns.") });
+  }
+
   if (req.method === "POST" && url.pathname === "/reviews") {
+    const order = db.orders.find((candidate) => candidate.id === body.order_id);
+    const hasDelivery = db.deliveries.some((candidate) => candidate.order_id === body.order_id);
     const item = {
       id: id("review"),
       at: new Date().toISOString(),
@@ -638,7 +790,8 @@ async function handle(req, res) {
       rating: body.rating || null,
       message: body.message || "",
       would_pay_again: body.would_pay_again ?? null,
-      raw: body
+      raw: body,
+      status: order && order.status === "funded" && hasDelivery ? "verified_review" : "unverified_review"
     };
     db.reviews.push(item);
     writeDb(db);
