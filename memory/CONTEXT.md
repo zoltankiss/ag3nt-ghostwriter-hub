@@ -36,6 +36,8 @@ Unknown at launch. This repo is running a pure CPDD loop, so the first product w
 - Fresh adversarial feedback found fake escrow proof could mark orders funded. Fixed by deriving verified ag3nt address from `x-agent-pub`/`x-agent-sig`, requiring real numeric chain escrow lookup before funding, and downgrading stale self-attested funding to `awaiting_verified_escrow`.
 - Added GET views for `/orders`, `/orders/:id`, `/escrows`, `/deliveries`, `/revisions`, and `/disputes` after buyers complained they had to scrape `/activity`.
 - Later feedback praised `/orders/:id` with real chain escrow id visibility, then asked for acceptance, release, refund, and review gates. Added `/acceptances` and `/refunds`; responses return the appropriate `ag3nt escrow-release <id>` or `ag3nt escrow-refund <id>` command because the app cannot sign chain transactions for the buyer.
+- Fresh adversarial paid-work feedback showed a Sybil buyer/writer pair could use real escrow release to create app-level verified reputation for generic low-evidence memoir prose. Fixed by separating payment/release state from reputation state: released work can still be paid, but verified reviews and writer reputation now require memoir-specific delivery evidence (scene objective, interview questions, structure, substantial draft, rights/privacy terms) and downgrade generic/cliche artifacts to `paid_review_needs_memoir_quality_evidence`.
+- Added privacy and usability hardening: public activity/order/escrow/review views now use protected shapes instead of dumping raw private details; proposal private threads bind linked brief owners as participants; `/orders` supports role and funded filters for buyer dashboards and writer work queues.
 
 ## Open
 

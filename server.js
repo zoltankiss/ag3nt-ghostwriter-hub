@@ -309,21 +309,21 @@ function publicActivity(db, actor = {}) {
       ad_click_to_funded_order: db.ad_attributions.filter((attribution) => attribution.status === "ready_to_attest").length
     },
     recent_feedback: db.feedback.slice(-10).reverse(),
-    recent_briefs: db.briefs.slice(-10).reverse(),
+    recent_briefs: db.briefs.slice(-10).reverse().map((brief) => publicBrief(brief, actor)),
     recent_samples: db.samples.slice(-10).reverse().map(publicSample),
-    recent_proposals: db.proposals.slice(-10).reverse().map((proposal) => publicProposal(proposal, actor)),
-    recent_profiles: db.profiles.slice(-10).reverse(),
-    recent_escrows: db.escrows.slice(-10).reverse(),
+    recent_proposals: db.proposals.slice(-10).reverse().map((proposal) => publicProposal(db, proposal, actor)),
+    recent_profiles: db.profiles.slice(-10).reverse().map(publicProfile),
+    recent_escrows: db.escrows.slice(-10).reverse().map((escrow) => publicEscrow(db, escrow, actor)),
     recent_intents: db.intents.slice(-10).reverse(),
     recent_offers: db.offers.slice(-10).reverse(),
     recent_orders: db.orders.slice(-10).reverse().map((order) => publicOrder(order, actor)),
     recent_deliveries: db.deliveries.slice(-10).reverse().map((delivery) => publicDelivery(db, delivery, db.orders.find((order) => order.id === delivery.order_id), actor)),
     recent_revisions: db.revisions.slice(-10).reverse(),
     recent_disputes: db.disputes.slice(-10).reverse(),
-    recent_acceptances: db.acceptances.slice(-10).reverse(),
-    recent_refunds: db.refunds.slice(-10).reverse(),
-    recent_releases: db.releases.slice(-10).reverse(),
-    recent_reviews: db.reviews.slice(-10).reverse(),
+    recent_acceptances: db.acceptances.slice(-10).reverse().map((acceptance) => publicOrderArtifact(db, acceptance, actor)),
+    recent_refunds: db.refunds.slice(-10).reverse().map((refund) => publicOrderArtifact(db, refund, actor)),
+    recent_releases: db.releases.slice(-10).reverse().map((release) => publicOrderArtifact(db, release, actor)),
+    recent_reviews: db.reviews.slice(-10).reverse().map((review) => publicOrderArtifact(db, review, actor)),
     recent_ad_attributions: db.ad_attributions.slice(-10).reverse(),
     recent_requests: db.requests.slice(-20).reverse()
   };
@@ -351,16 +351,31 @@ function actorCanViewOrderPrivate(order, actor) {
   return actorIsBuyer(order, actor) || actorIsWriter(order, actor);
 }
 
-function canViewProposal(proposal, actor) {
-  if (!proposal || proposal.visibility === "public") return true;
-  if (!actor.signed || !actor.address) return false;
-  const participants = new Set([
+function proposalParticipantAddresses(db, proposal) {
+  if (!proposal) return new Set();
+  const brief = proposal.brief_id ? db.briefs.find((candidate) => candidate.id === proposal.brief_id) : null;
+  const sample = proposal.sample_id ? db.samples.find((candidate) => candidate.id === proposal.sample_id) : null;
+  const match = proposal.match_id ? db.matches.find((candidate) => candidate.id === proposal.match_id) : null;
+  const order = proposal.id ? db.orders.find((candidate) => candidate.proposal_id === proposal.id) : null;
+  return new Set([
     proposal.actor?.address,
+    proposal.buyer_addr,
     proposal.payee_addr,
+    brief?.actor?.address,
+    sample?.actor?.address,
+    match?.actor?.address,
+    order?.actor?.address,
+    order?.payee_addr,
     ...proposal.messages.map((message) => message.actor?.address),
+    ...proposal.messages.map((message) => message.buyer_addr),
     ...proposal.messages.map((message) => message.payee_addr)
   ].filter(Boolean));
-  return participants.has(actor.address);
+}
+
+function canViewProposal(db, proposal, actor) {
+  if (!proposal || proposal.visibility === "public") return true;
+  if (!actor.signed || !actor.address) return false;
+  return proposalParticipantAddresses(db, proposal).has(actor.address);
 }
 
 function verifiedEscrowForOrder(db, order) {
@@ -398,6 +413,56 @@ function verifiedAcceptanceForOrder(db, order, deliveryId = null) {
   ) || null;
 }
 
+function deliveryQualityEvidence(delivery) {
+  const raw = delivery?.raw || {};
+  const text = [
+    delivery?.scene_objective,
+    delivery?.interview_questions,
+    delivery?.outline_beats,
+    delivery?.draft,
+    delivery?.excerpt,
+    delivery?.notes,
+    raw.scene_objective,
+    raw.interview_questions,
+    raw.outline_beats,
+    raw.chapter_architecture,
+    raw.acceptance_rubric
+  ].filter(Boolean).join(" ").toLowerCase();
+  const draftText = String(delivery?.draft || raw.full_draft || raw.draft || delivery?.excerpt || "");
+  const genericPhrases = [
+    "life is a journey",
+    "became whole",
+    "healing takes courage",
+    "the business was hard",
+    "my daughter was sad"
+  ];
+  const evidence = {
+    has_scene_objective: Boolean(delivery?.scene_objective || raw.scene_objective || /scene objective|opening scene|scene strategy/.test(text)),
+    has_interview_questions: Boolean(delivery?.interview_questions || raw.interview_questions || /interview questions?/.test(text)),
+    has_structure: Boolean(delivery?.outline_beats || raw.outline_beats || raw.chapter_architecture || /chapter (beats?|map)|outline beats?|architecture/.test(text)),
+    has_substantial_draft: draftText.replace(/\s+/g, " ").trim().length >= 500,
+    has_rights_terms: /rights|confidential|no[- ]reuse|privacy|transfer/.test(text) || /after_(acceptance_and_payment|release)/.test(String(delivery?.rights_transfer || "")),
+    appears_generic: genericPhrases.some((phrase) => text.includes(phrase))
+  };
+  evidence.score = [
+    evidence.has_scene_objective,
+    evidence.has_interview_questions,
+    evidence.has_structure,
+    evidence.has_substantial_draft,
+    evidence.has_rights_terms
+  ].filter(Boolean).length - (evidence.appears_generic ? 2 : 0);
+  evidence.status = evidence.score >= 3 ? "memoir_quality_evidence_present" : "needs_memoir_quality_evidence";
+  return evidence;
+}
+
+function reputationEligibleAcceptance(db, order, deliveryId = null) {
+  const acceptance = verifiedAcceptanceForOrder(db, order, deliveryId);
+  if (!acceptance) return null;
+  const delivery = verifiedWriterDeliveryForOrder(db, order, acceptance.delivery_id);
+  const evidence = deliveryQualityEvidence(delivery);
+  return evidence.status === "memoir_quality_evidence_present" ? { acceptance, delivery, evidence } : null;
+}
+
 function releasedEscrowForOrder(db, order) {
   const verifiedEscrow = verifiedEscrowForOrder(db, order);
   if (!verifiedEscrow) return null;
@@ -414,17 +479,21 @@ function orderTrustState(db, order) {
   const verified_escrow = verifiedEscrowForOrder(db, order);
   const latest_writer_delivery = verifiedWriterDeliveryForOrder(db, order);
   const accepted_delivery = verifiedAcceptanceForOrder(db, order, latest_writer_delivery?.id);
+  const quality_evidence = latest_writer_delivery ? deliveryQualityEvidence(latest_writer_delivery) : null;
+  const reputation_eligible_acceptance = accepted_delivery && quality_evidence?.status === "memoir_quality_evidence_present" ? accepted_delivery : null;
   const released_escrow = accepted_delivery ? releasedEscrowForOrder(db, order) : null;
   return {
     buyer_addr: order?.actor?.address || null,
     writer_addr: order?.payee_addr || null,
     verified_escrow: verified_escrow || null,
     latest_writer_delivery: latest_writer_delivery || null,
+    delivery_quality_evidence: quality_evidence,
     accepted_delivery: accepted_delivery || null,
+    reputation_eligible_acceptance: reputation_eligible_acceptance || null,
     released_escrow: released_escrow || null,
     payment_state: released_escrow ? "released_paid" : accepted_delivery ? "accepted_pending_release" : verified_escrow ? "funded" : "unfunded",
     rights_state: released_escrow ? "transferred_after_release" : accepted_delivery ? "accepted_not_transferred_until_release" : "not_transferred",
-    writer_reputation_state: released_escrow ? "earned_paid_delivery" : accepted_delivery ? "pending_release" : verified_escrow ? "pending_delivery_acceptance" : "not_earned"
+    writer_reputation_state: released_escrow && reputation_eligible_acceptance ? "earned_paid_delivery" : released_escrow ? "paid_needs_memoir_quality_evidence" : accepted_delivery ? "pending_release" : verified_escrow ? "pending_delivery_acceptance" : "not_earned"
   };
 }
 
@@ -447,6 +516,7 @@ function reconcileOrderTrust(db) {
 
   for (const delivery of db.deliveries) {
     const order = db.orders.find((candidate) => candidate.id === delivery.order_id);
+    delivery.quality_evidence = deliveryQualityEvidence(delivery);
     if (!order || !actorIsWriter(order, delivery.actor)) {
       delivery.status = "invalid_unverified_writer_or_order";
     } else if (!verifiedEscrowForOrder(db, order)) {
@@ -460,11 +530,13 @@ function reconcileOrderTrust(db) {
 
   for (const acceptance of db.acceptances) {
     const order = db.orders.find((candidate) => candidate.id === acceptance.order_id);
+    const delivery = order ? verifiedWriterDeliveryForOrder(db, order, acceptance.delivery_id) : null;
+    acceptance.quality_evidence = delivery ? deliveryQualityEvidence(delivery) : null;
     if (
       !order ||
       !actorIsBuyer(order, acceptance.actor) ||
       !verifiedEscrowForOrder(db, order) ||
-      !verifiedWriterDeliveryForOrder(db, order, acceptance.delivery_id)
+      !delivery
     ) {
       acceptance.status = "invalid_unverified_order_delivery_or_actor";
       acceptance.release_command = null;
@@ -473,8 +545,14 @@ function reconcileOrderTrust(db) {
 
   for (const review of db.reviews) {
     const order = db.orders.find((candidate) => candidate.id === review.order_id);
-    const paid = order && actorIsBuyer(order, review.actor) && verifiedAcceptanceForOrder(db, order) && releasedEscrowForOrder(db, order);
+    const reputationReady = order && reputationEligibleAcceptance(db, order) && releasedEscrowForOrder(db, order);
+    const paid = order && actorIsBuyer(order, review.actor) && reputationReady;
+    const accepted = order ? verifiedAcceptanceForOrder(db, order) : null;
+    review.quality_evidence = accepted ? deliveryQualityEvidence(verifiedWriterDeliveryForOrder(db, order, accepted.delivery_id)) : null;
     review.status = paid ? "verified_paid_review" : "unverified_review";
+    if (order && actorIsBuyer(order, review.actor) && releasedEscrowForOrder(db, order) && !reputationReady) {
+      review.status = "paid_review_needs_memoir_quality_evidence";
+    }
   }
 
   for (const conversion of db.conversions) {
@@ -519,6 +597,21 @@ function recordAdAttribution(db, order, body, actor) {
   return item;
 }
 
+function publicProfile(profile) {
+  const { raw, ...safe } = profile;
+  return safe;
+}
+
+function publicBrief(brief, actor) {
+  const canViewFull = actor?.signed && isSameAddress(actor.address, brief.actor?.address);
+  return {
+    ...brief,
+    story: canViewFull ? brief.story : previewText(brief.story, 260),
+    raw: canViewFull ? brief.raw : undefined,
+    protected_private_details: canViewFull ? false : true
+  };
+}
+
 function publicSample(sample) {
   return {
     ...sample,
@@ -528,11 +621,12 @@ function publicSample(sample) {
   };
 }
 
-function publicProposal(proposal, actor) {
-  const canViewFull = canViewProposal(proposal, actor);
+function publicProposal(db, proposal, actor) {
+  const canViewFull = canViewProposal(db, proposal, actor);
   const { messages, raw, ...base } = proposal;
   return {
     ...base,
+    participant_addrs: canViewFull ? [...proposalParticipantAddresses(db, proposal)] : undefined,
     message_count: messages.length,
     messages: canViewFull ? messages : "withheld_from_public_listing",
     raw: canViewFull ? raw : undefined
@@ -549,15 +643,67 @@ function publicOrder(order, actor) {
   };
 }
 
+function publicEscrow(db, escrow, actor) {
+  const order = db.orders.find((candidate) => candidate.id === escrow.order_id);
+  const canViewFull = order && actorCanViewOrderPrivate(order, actor);
+  return {
+    ...escrow,
+    chain_escrow: canViewFull ? escrow.chain_escrow : escrow.chain_escrow ? {
+      id: escrow.chain_escrow.id,
+      amount: escrow.chain_escrow.amount,
+      status: escrow.chain_escrow.status,
+      ref: escrow.chain_escrow.ref
+    } : null,
+    proof: canViewFull ? escrow.proof : undefined,
+    raw: canViewFull ? escrow.raw : undefined,
+    protected_private_details: canViewFull ? false : true
+  };
+}
+
 function publicDelivery(db, delivery, order, actor) {
+  const quality_evidence = deliveryQualityEvidence(delivery);
   const canViewFull = order && actorCanViewOrderPrivate(order, actor) && verifiedEscrowForOrder(db, order);
   return {
     ...delivery,
     excerpt: canViewFull ? delivery.excerpt : previewText(delivery.excerpt, 280),
     draft: canViewFull ? delivery.draft : undefined,
     private_notes: canViewFull ? delivery.private_notes : undefined,
+    quality_evidence,
     protected_full_draft: canViewFull ? false : true,
     raw: canViewFull ? delivery.raw : undefined
+  };
+}
+
+function publicTrustState(db, order, actor) {
+  const trust = orderTrustState(db, order);
+  return {
+    buyer_addr: trust.buyer_addr,
+    writer_addr: trust.writer_addr,
+    verified_escrow: trust.verified_escrow ? publicEscrow(db, trust.verified_escrow, actor) : null,
+    latest_writer_delivery: trust.latest_writer_delivery ? publicDelivery(db, trust.latest_writer_delivery, order, actor) : null,
+    delivery_quality_evidence: trust.delivery_quality_evidence,
+    accepted_delivery: trust.accepted_delivery ? publicOrderArtifact(db, trust.accepted_delivery, actor) : null,
+    reputation_eligible_acceptance: trust.reputation_eligible_acceptance ? publicOrderArtifact(db, trust.reputation_eligible_acceptance, actor) : null,
+    released_escrow: trust.released_escrow ? publicOrderArtifact(db, trust.released_escrow, actor) : null,
+    payment_state: trust.payment_state,
+    rights_state: trust.rights_state,
+    writer_reputation_state: trust.writer_reputation_state
+  };
+}
+
+function publicOrderArtifact(db, item, actor) {
+  const order = db.orders.find((candidate) => candidate.id === item.order_id);
+  const canViewFull = order && actorCanViewOrderPrivate(order, actor);
+  const { raw, proof, chain_escrow, ...safe } = item;
+  return {
+    ...safe,
+    notes: canViewFull ? item.notes : item.notes ? previewText(item.notes, 160) : item.notes,
+    reason: canViewFull ? item.reason : item.reason ? previewText(item.reason, 160) : item.reason,
+    message: canViewFull ? item.message : item.message ? previewText(item.message, 160) : item.message,
+    proof: canViewFull ? proof : undefined,
+    chain_escrow: canViewFull ? chain_escrow : chain_escrow ? { id: chain_escrow.id, status: chain_escrow.status, ref: chain_escrow.ref } : undefined,
+    raw: canViewFull ? raw : undefined,
+    protected_private_details: canViewFull ? false : true
   };
 }
 
@@ -642,10 +788,35 @@ async function handle(req, res) {
   }
 
   if (req.method === "GET" && url.pathname === "/orders") {
+    let orders = db.orders.slice();
+    const statusFilter = url.searchParams.get("status");
+    const payeeFilter = url.searchParams.get("payee_addr");
+    const buyerFilter = url.searchParams.get("buyer_addr");
+    const roleFilter = url.searchParams.get("role");
+    const fundedOnly = url.searchParams.get("funded") === "true";
+    if (payeeFilter === "me" || roleFilter === "writer") {
+      orders = actor.signed ? orders.filter((order) => actorIsWriter(order, actor)) : [];
+    } else if (payeeFilter) {
+      orders = orders.filter((order) => isSameAddress(order.payee_addr, payeeFilter));
+    }
+    if (buyerFilter === "me" || roleFilter === "buyer") {
+      orders = actor.signed ? orders.filter((order) => actorIsBuyer(order, actor)) : [];
+    } else if (buyerFilter) {
+      orders = orders.filter((order) => isSameAddress(order.actor?.address, buyerFilter));
+    }
+    if (statusFilter) orders = orders.filter((order) => order.status === statusFilter || orderTrustState(db, order).payment_state === statusFilter);
+    if (fundedOnly) orders = orders.filter((order) => Boolean(verifiedEscrowForOrder(db, order)));
     writeDb(db);
     return send(res, 200, {
-      orders: db.orders,
-      ui: ui("Orders", "Funded orders have chain-verified escrow ids.")
+      orders: orders.map((order) => publicOrder(order, actor)),
+      filters: {
+        status: statusFilter,
+        payee_addr: payeeFilter,
+        buyer_addr: buyerFilter,
+        role: roleFilter,
+        funded: fundedOnly
+      },
+      ui: ui("Orders", "Use ?role=writer&funded=true for a safe paid work queue, or ?role=buyer for your buyer dashboard.")
     });
   }
 
@@ -659,17 +830,18 @@ async function handle(req, res) {
     writeDb(db);
     return send(res, 200, {
       order: publicOrder(order, actor),
-      escrows: db.escrows.filter((item) => item.order_id === orderId),
+      escrows: db.escrows.filter((item) => item.order_id === orderId).map((escrow) => publicEscrow(db, escrow, actor)),
       deliveries: db.deliveries
         .filter((item) => item.order_id === orderId)
         .map((delivery) => publicDelivery(db, delivery, order, actor)),
       revisions: db.revisions.filter((item) => item.order_id === orderId),
       disputes: db.disputes.filter((item) => item.order_id === orderId),
-      acceptances: db.acceptances.filter((item) => item.order_id === orderId),
-      refunds: db.refunds.filter((item) => item.order_id === orderId),
-      releases: db.releases.filter((item) => item.order_id === orderId),
-      reviews: db.reviews.filter((item) => item.order_id === orderId),
-      verified_escrow: verifiedEscrowForOrder(db, order),
+      acceptances: db.acceptances.filter((item) => item.order_id === orderId).map((item) => publicOrderArtifact(db, item, actor)),
+      refunds: db.refunds.filter((item) => item.order_id === orderId).map((item) => publicOrderArtifact(db, item, actor)),
+      releases: db.releases.filter((item) => item.order_id === orderId).map((item) => publicOrderArtifact(db, item, actor)),
+      reviews: db.reviews.filter((item) => item.order_id === orderId).map((item) => publicOrderArtifact(db, item, actor)),
+      verified_escrow: verifiedEscrowForOrder(db, order) ? publicEscrow(db, verifiedEscrowForOrder(db, order), actor) : null,
+      trust: publicTrustState(db, order, actor),
       ui: ui("Order status", "Review escrow, delivery, revision, dispute, and review state from one place.", [
         { method: "POST", path: "/acceptances", label: "Accept delivery" },
         { method: "POST", path: "/releases", label: "Record release" },
@@ -682,7 +854,7 @@ async function handle(req, res) {
   if (req.method === "GET" && url.pathname === "/profiles") {
     writeDb(db);
     return send(res, 200, {
-      profiles: db.profiles,
+      profiles: db.profiles.map(publicProfile),
       ui: ui("Profiles", "Signed profiles make counterparty review less blind.")
     });
   }
@@ -692,6 +864,7 @@ async function handle(req, res) {
       id: id("profile"),
       at: new Date().toISOString(),
       actor,
+      display_name: body.display_name || body.name || body.handle || null,
       role: body.role || "unspecified",
       wallet: body.wallet || body.actor_addr || actor.address || null,
       portfolio: body.portfolio || null,
@@ -714,7 +887,7 @@ async function handle(req, res) {
   if (req.method === "GET" && url.pathname === "/briefs") {
     writeDb(db);
     return send(res, 200, {
-      briefs: db.briefs,
+      briefs: db.briefs.map((brief) => publicBrief(brief, actor)),
       ui: ui("Memoir briefs", "Writers can answer a brief with POST /samples.")
     });
   }
@@ -822,7 +995,7 @@ async function handle(req, res) {
       writeDb(db);
       return send(res, 404, { error: "proposal_not_found", ui: ui("Proposal not found", "Use GET /proposals.") });
     }
-    if (!canViewProposal(proposal, actor)) {
+    if (!canViewProposal(db, proposal, actor)) {
       writeDb(db);
       return send(res, 403, {
         error: "private_proposal",
@@ -831,7 +1004,7 @@ async function handle(req, res) {
     }
     writeDb(db);
     return send(res, 200, {
-      proposal,
+      proposal: publicProposal(db, proposal, actor),
       ui: ui("Proposal thread", "Use POST /proposals with proposal_id to reply, confirm terms, or move toward escrow.")
     });
   }
@@ -839,13 +1012,15 @@ async function handle(req, res) {
   if (req.method === "GET" && url.pathname === "/proposals") {
     writeDb(db);
     return send(res, 200, {
-      proposals: db.proposals.map((proposal) => publicProposal(proposal, actor)),
+      proposals: db.proposals.map((proposal) => publicProposal(db, proposal, actor)),
       ui: ui("Proposals", "Use proposal threads for interview questions, payee confirmation, terms, and milestone acceptance before /orders.")
     });
   }
 
   if (req.method === "POST" && url.pathname === "/proposals") {
     const existing = body.proposal_id ? db.proposals.find((proposal) => proposal.id === body.proposal_id) : null;
+    const linkedBriefId = body.brief_id || existing?.brief_id || null;
+    const linkedBrief = linkedBriefId ? db.briefs.find((brief) => brief.id === linkedBriefId) : null;
     const message = {
       id: id("msg"),
       at: new Date().toISOString(),
@@ -854,13 +1029,17 @@ async function handle(req, res) {
       message: body.message || "",
       questions: body.questions || null,
       terms: body.terms || null,
+      buyer_addr: body.buyer_addr || linkedBrief?.actor?.address || null,
       payee_addr: body.payee_addr || null,
       milestone_amount: body.milestone_amount || body.amount || null,
-      acceptance_criteria: body.acceptance_criteria || null
+      acceptance_criteria: body.acceptance_criteria || null,
+      chapter_architecture: body.chapter_architecture || null,
+      rights_terms: body.rights_terms || null,
+      revision_terms: body.revision_terms || null
     };
 
     if (existing) {
-      if (!canViewProposal(existing, actor)) {
+      if (!canViewProposal(db, existing, actor)) {
         writeDb(db);
         return send(res, 403, {
           error: "private_proposal",
@@ -869,9 +1048,13 @@ async function handle(req, res) {
       }
       existing.messages.push(message);
       existing.updated_at = message.at;
+      if (body.buyer_addr) existing.buyer_addr = body.buyer_addr;
       if (body.payee_addr) existing.payee_addr = body.payee_addr;
       if (body.milestone_amount || body.amount) existing.milestone_amount = body.milestone_amount || body.amount;
       if (body.terms) existing.terms = body.terms;
+      if (body.chapter_architecture) existing.chapter_architecture = body.chapter_architecture;
+      if (body.rights_terms) existing.rights_terms = body.rights_terms;
+      if (body.revision_terms) existing.revision_terms = body.revision_terms;
       if (body.status) existing.status = body.status;
       writeDb(db);
       return send(res, 201, {
@@ -891,11 +1074,15 @@ async function handle(req, res) {
       match_id: body.match_id || null,
       intent_id: body.intent_id || null,
       offer_id: body.offer_id || null,
+      buyer_addr: body.buyer_addr || linkedBrief?.actor?.address || null,
       payee_addr: body.payee_addr || null,
       milestone_amount: body.milestone_amount || body.amount || null,
       visibility: body.visibility === "public" ? "public" : "private_thread",
       terms: body.terms || null,
       acceptance_criteria: body.acceptance_criteria || null,
+      chapter_architecture: body.chapter_architecture || null,
+      rights_terms: body.rights_terms || null,
+      revision_terms: body.revision_terms || null,
       messages: [message],
       raw: body,
       status: actor.signed ? "open" : "unsigned_draft"
@@ -905,8 +1092,20 @@ async function handle(req, res) {
     return send(res, 201, {
       ok: true,
       proposal: item,
-      next: [{ method: "POST", path: "/orders", label: "Fund milestone" }],
-      ui: ui("Proposal opened", "This is the private pre-order room for memoir questions, terms, payee confirmation, and milestone scope.")
+      next: [
+        {
+          method: "POST",
+          path: "/orders",
+          label: "Fund milestone",
+          body_hint: {
+            proposal_id: item.id,
+            brief_id: item.brief_id,
+            amount: item.milestone_amount,
+            payee_addr: item.payee_addr
+          }
+        }
+      ],
+      ui: ui(item.visibility === "public" ? "Proposal opened" : "Private proposal opened", "Confirm payee, milestone amount, acceptance criteria, and escrow before creating /orders.")
     });
   }
 
@@ -1093,7 +1292,7 @@ async function handle(req, res) {
 
   if (req.method === "GET" && url.pathname === "/escrows") {
     writeDb(db);
-    return send(res, 200, { escrows: db.escrows, ui: ui("Escrows", "Only chain-verified escrows fund orders.") });
+    return send(res, 200, { escrows: db.escrows.map((escrow) => publicEscrow(db, escrow, actor)), ui: ui("Escrows", "Only chain-verified escrows fund orders.") });
   }
 
   if (req.method === "POST" && url.pathname === "/deliveries") {
@@ -1124,6 +1323,7 @@ async function handle(req, res) {
       raw: body,
       status: deliveryStatus
     };
+    item.quality_evidence = deliveryQualityEvidence(item);
     db.deliveries.push(item);
     writeDb(db);
     return send(res, 201, {
@@ -1220,6 +1420,7 @@ async function handle(req, res) {
     const verifiedEscrow = verifiedEscrowForOrder(db, order);
     const escrowId = verifiedEscrow && verifiedEscrow.escrow_id;
     const canAccept = order && delivery && escrowId && actorIsBuyer(order, actor);
+    const qualityEvidence = delivery ? deliveryQualityEvidence(delivery) : null;
     const item = {
       id: id("accept"),
       at: new Date().toISOString(),
@@ -1228,6 +1429,7 @@ async function handle(req, res) {
       delivery_id: body.delivery_id || null,
       notes: body.notes || "",
       acceptance_rubric: body.acceptance_rubric || body.rubric || null,
+      quality_evidence: qualityEvidence,
       release_command: canAccept ? `ag3nt escrow-release ${escrowId}` : null,
       raw: body,
       status: canAccept ? "ready_to_release" : "invalid_unverified_order_delivery_escrow_or_buyer"
@@ -1244,7 +1446,7 @@ async function handle(req, res) {
 
   if (req.method === "GET" && url.pathname === "/acceptances") {
     writeDb(db);
-    return send(res, 200, { acceptances: db.acceptances, ui: ui("Acceptances", "Accepted deliveries can be released on chain.") });
+    return send(res, 200, { acceptances: db.acceptances.map((item) => publicOrderArtifact(db, item, actor)), ui: ui("Acceptances", "Accepted deliveries can be released on chain; reputation requires memoir quality evidence.") });
   }
 
   if (req.method === "POST" && url.pathname === "/refunds") {
@@ -1275,7 +1477,7 @@ async function handle(req, res) {
 
   if (req.method === "GET" && url.pathname === "/refunds") {
     writeDb(db);
-    return send(res, 200, { refunds: db.refunds, ui: ui("Refunds", "Refund requests and chain commands.") });
+    return send(res, 200, { refunds: db.refunds.map((item) => publicOrderArtifact(db, item, actor)), ui: ui("Refunds", "Refund requests and chain commands.") });
   }
 
   if (req.method === "POST" && url.pathname === "/releases") {
@@ -1310,7 +1512,7 @@ async function handle(req, res) {
 
   if (req.method === "GET" && url.pathname === "/releases") {
     writeDb(db);
-    return send(res, 200, { releases: db.releases, ui: ui("Releases", "Release records tie paid reputation to chain release status.") });
+    return send(res, 200, { releases: db.releases.map((item) => publicOrderArtifact(db, item, actor)), ui: ui("Releases", "Release records tie paid reputation to chain release status.") });
   }
 
   if (req.method === "GET" && url.pathname === "/ad-attributions") {
@@ -1325,7 +1527,9 @@ async function handle(req, res) {
     const order = db.orders.find((candidate) => candidate.id === body.order_id);
     const accepted = verifiedAcceptanceForOrder(db, order);
     const released = releasedEscrowForOrder(db, order);
-    const verifiedPaidReview = Boolean(order && actorIsBuyer(order, actor) && accepted && released);
+    const reputationReady = Boolean(order && reputationEligibleAcceptance(db, order, accepted?.delivery_id) && released);
+    const verifiedPaidReview = Boolean(order && actorIsBuyer(order, actor) && accepted && released && reputationReady);
+    const paidButNeedsQuality = Boolean(order && actorIsBuyer(order, actor) && accepted && released && !reputationReady);
     const item = {
       id: id("review"),
       at: new Date().toISOString(),
@@ -1334,15 +1538,16 @@ async function handle(req, res) {
       rating: body.rating || null,
       message: body.message || "",
       would_pay_again: body.would_pay_again ?? null,
+      quality_evidence: accepted ? deliveryQualityEvidence(verifiedWriterDeliveryForOrder(db, order, accepted.delivery_id)) : null,
       raw: body,
-      status: verifiedPaidReview ? "verified_paid_review" : "unverified_review"
+      status: verifiedPaidReview ? "verified_paid_review" : paidButNeedsQuality ? "paid_review_needs_memoir_quality_evidence" : "unverified_review"
     };
     db.reviews.push(item);
     writeDb(db);
     return send(res, 201, {
       ok: true,
       review: item,
-      ui: ui("Review recorded", "Repeated buyer reviews will drive trust and ranking features.")
+      ui: ui("Review recorded", verifiedPaidReview ? "This paid review can count toward reputation." : "Reviews need paid release plus memoir-specific delivery evidence before they count toward reputation.")
     });
   }
 
