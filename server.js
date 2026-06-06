@@ -297,7 +297,7 @@ function publicActivity(db, actor = {}) {
       reviews: db.reviews.length,
       ad_attributions: db.ad_attributions.length,
       signed_orders: db.orders.filter((o) => o.actor.signed).length,
-      funded_orders: db.orders.filter((o) => o.status === "funded").length
+      funded_orders: db.orders.filter((order) => orderTrustState(db, order).verified_escrow).length
     },
     metrics: {
       funded_milestones: db.orders.filter((order) => orderTrustState(db, order).verified_escrow).length,
@@ -318,7 +318,7 @@ function publicActivity(db, actor = {}) {
     recent_offers: db.offers.slice(-10).reverse(),
     recent_orders: db.orders.slice(-10).reverse().map((order) => publicOrderSummary(db, order, actor)),
     recent_deliveries: db.deliveries.slice(-10).reverse().map((delivery) => publicDelivery(db, delivery, db.orders.find((order) => order.id === delivery.order_id), actor)),
-    recent_revisions: db.revisions.slice(-10).reverse(),
+    recent_revisions: db.revisions.slice(-10).reverse().map((revision) => publicRevision(db, revision, actor)),
     recent_disputes: db.disputes.slice(-10).reverse(),
     recent_acceptances: db.acceptances.slice(-10).reverse().map((acceptance) => publicOrderArtifact(db, acceptance, actor)),
     recent_refunds: db.refunds.slice(-10).reverse().map((refund) => publicOrderArtifact(db, refund, actor)),
@@ -743,21 +743,102 @@ function publicEscrow(db, escrow, actor) {
   };
 }
 
+function acceptanceChecklist(delivery = null, revision = null) {
+  return {
+    voice_matches_buyer_material: "Does the draft sound like the speaker rather than a generic success memoir?",
+    uses_confirmed_anchors_only: "Does it use agreed objects, places, dialogue, and facts without inventing private specifics?",
+    scene_has_clear_objective: "Does the scene have a concrete objective and visible tension?",
+    structure_supports_next_milestone: "Do the beats make the next chapter/outline milestone easier to fund?",
+    emotionally_restrained: "Does the draft avoid explaining the meaning when an object/action can carry it?",
+    avoids_cliche_language: "Does it avoid generic healing, resilience, journey, and inspirational language?",
+    privacy_respected: "Are names, family details, business details, and medical/client facts handled according to the terms?",
+    revision_blockers_resolved: revision ? "Were the buyer's stated revision blockers resolved?" : "If anything blocks acceptance, request a focused revision before release.",
+    rights_release_understood: "Acceptance prepares release, but rights transfer only after escrow release if the order terms say so.",
+    would_fund_next_milestone: "Would this work justify funding the next paid milestone?"
+  };
+}
+
 function publicDelivery(db, delivery, order, actor) {
   const quality_evidence = deliveryQualityEvidence(delivery);
   const canViewFull = order && actorCanViewOrderPrivate(order, actor) && verifiedEscrowForOrder(db, order);
   const hasFullDraft = Boolean(delivery.draft);
-  return {
-    ...delivery,
+  const base = {
+    id: delivery.id,
+    at: delivery.at,
+    actor: delivery.actor,
+    order_id: delivery.order_id,
+    content_hash: delivery.content_hash,
     excerpt: canViewFull ? delivery.excerpt : previewText(delivery.excerpt, 280),
-    draft: canViewFull ? delivery.draft : undefined,
-    private_notes: canViewFull ? delivery.private_notes : undefined,
+    revised_from_revision_id: delivery.revised_from_revision_id || null,
+    supersedes_delivery_id: delivery.supersedes_delivery_id || null,
+    status: delivery.status,
     quality_evidence,
     substantive_delivery: deliveryIsSubstantive(delivery),
+    protected_private_details: !canViewFull,
+    protected_scene_objective: Boolean(delivery.scene_objective),
+    protected_interview_questions: Boolean(delivery.interview_questions),
+    protected_outline_beats: Boolean(delivery.outline_beats),
+    protected_rights_terms: Boolean(delivery.rights_transfer),
     protected_full_draft_from_public: hasFullDraft,
-    full_draft_visible_to_actor: Boolean(canViewFull && hasFullDraft),
-    raw: canViewFull ? delivery.raw : undefined
+    full_draft_visible_to_actor: Boolean(canViewFull && hasFullDraft)
   };
+  if (!canViewFull) return base;
+  return {
+    ...base,
+    scene_objective: delivery.scene_objective,
+    interview_questions: delivery.interview_questions,
+    outline_beats: delivery.outline_beats,
+    draft: delivery.draft,
+    private_notes: delivery.private_notes,
+    rights_transfer: delivery.rights_transfer,
+    notes: delivery.notes,
+    raw: delivery.raw
+  };
+}
+
+function publicRevision(db, revision, actor) {
+  const order = db.orders.find((candidate) => candidate.id === revision.order_id);
+  const canViewFull = order && actorCanViewOrderPrivate(order, actor);
+  return {
+    id: revision.id,
+    at: revision.at,
+    actor: revision.actor,
+    order_id: revision.order_id,
+    delivery_id: revision.delivery_id,
+    request: canViewFull ? revision.request : revision.request ? "withheld_from_public_listing" : "",
+    acceptance_blocker: canViewFull ? revision.acceptance_blocker : revision.acceptance_blocker ? "withheld_from_public_listing" : null,
+    rubric: canViewFull ? revision.rubric : revision.rubric ? "withheld_from_public_listing" : null,
+    raw: canViewFull ? revision.raw : undefined,
+    status: revision.status,
+    protected_private_details: !canViewFull
+  };
+}
+
+function revisionComparisonPackets(db, order, actor) {
+  if (!order || !actorCanViewOrderPrivate(order, actor)) return [];
+  return db.revisions
+    .filter((revision) => revision.order_id === order.id)
+    .map((revision) => {
+      const original = revision.delivery_id
+        ? db.deliveries.find((delivery) => delivery.id === revision.delivery_id && delivery.order_id === order.id)
+        : null;
+      const revised = db.deliveries
+        .slice()
+        .reverse()
+        .find((delivery) =>
+          delivery.order_id === order.id &&
+          delivery.revised_from_revision_id === revision.id &&
+          actorIsWriter(order, delivery.actor)
+        ) || null;
+      return {
+        revision: publicRevision(db, revision, actor),
+        original_delivery: original ? publicDelivery(db, original, order, actor) : null,
+        revised_delivery: revised ? publicDelivery(db, revised, order, actor) : null,
+        original_quality_evidence: original ? deliveryQualityEvidence(original) : null,
+        revised_quality_evidence: revised ? deliveryQualityEvidence(revised) : null,
+        acceptance_checklist: acceptanceChecklist(revised || original, revision)
+      };
+    });
 }
 
 function publicTrustState(db, order, actor) {
@@ -927,7 +1008,8 @@ async function handle(req, res) {
       deliveries: db.deliveries
         .filter((item) => item.order_id === orderId)
         .map((delivery) => publicDelivery(db, delivery, order, actor)),
-      revisions: db.revisions.filter((item) => item.order_id === orderId),
+      revisions: db.revisions.filter((item) => item.order_id === orderId).map((revision) => publicRevision(db, revision, actor)),
+      revision_comparisons: revisionComparisonPackets(db, order, actor),
       disputes: db.disputes.filter((item) => item.order_id === orderId),
       acceptances: db.acceptances.filter((item) => item.order_id === orderId).map((item) => publicOrderArtifact(db, item, actor)),
       refunds: db.refunds.filter((item) => item.order_id === orderId).map((item) => publicOrderArtifact(db, item, actor)),
@@ -935,6 +1017,7 @@ async function handle(req, res) {
       reviews: db.reviews.filter((item) => item.order_id === orderId).map((item) => publicOrderArtifact(db, item, actor)),
       verified_escrow: verifiedEscrowForOrder(db, order) ? publicEscrow(db, verifiedEscrowForOrder(db, order), actor) : null,
       trust: publicTrustState(db, order, actor),
+      acceptance_checklist: acceptanceChecklist(latestSubstantiveWriterDeliveryForOrder(db, order), orderTrustState(db, order).latest_revision_request),
       ui: ui("Order status", "Review escrow, delivery, revision, dispute, and review state from one place.", [
         { method: "POST", path: "/acceptances", label: "Accept delivery" },
         { method: "POST", path: "/releases", label: "Record release" },
@@ -1503,7 +1586,7 @@ async function handle(req, res) {
 
   if (req.method === "GET" && url.pathname === "/revisions") {
     writeDb(db);
-    return send(res, 200, { revisions: db.revisions, ui: ui("Revisions", "Use /orders/:id for order-specific status.") });
+    return send(res, 200, { revisions: db.revisions.map((revision) => publicRevision(db, revision, actor)), ui: ui("Revisions", "Use /orders/:id for order-specific status.") });
   }
 
   if (req.method === "POST" && url.pathname === "/disputes") {
@@ -1557,6 +1640,7 @@ async function handle(req, res) {
     return send(res, 201, {
       ok: true,
       acceptance: item,
+      acceptance_checklist: acceptanceChecklist(delivery, latestRevisionAfterDelivery(db, order, delivery)),
       ui: ui("Acceptance recorded", item.release_command ? `Release funds with: ${item.release_command}` : "Attach order, delivery, and escrow before release.")
     });
   }
