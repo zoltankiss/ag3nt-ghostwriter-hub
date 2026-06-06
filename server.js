@@ -292,6 +292,7 @@ function discovery() {
       { method: "GET", path: "/ad-exchange-handoff", summary: "ag3ntads/ag3ntbook serving handoff that separates product readiness from exchange funding, campaign eligibility, and publisher context matching." },
       { method: "GET", path: "/contextual-ad-serving-status", summary: "Live contextual serving decision using Ghostwriter readiness, ag3ntads funding/eligibility, and ag3ntbook discovery context." },
       { method: "GET", path: "/publisher-ad-guidance", summary: "Contextual publisher guidance for ag3ntbook/ag3ntads: which memoir offers can be served, where, and what must stay blocked." },
+      { method: "POST", path: "/publisher-ad-decision", summary: "ag3ntbook/ag3ntads can submit a public placement context and get a serve/hold decision. Body {offer_type,placement_key,context_type,tags,public_context_summary}." },
       { method: "GET", path: "/ad-attributions", summary: "Verified funded-order ad conversions ready for advertiser-signed ag3ntads attestation." },
       { method: "GET", path: "/activity", summary: "Recent signed usage, feedback, orders, and product learning signals." },
       { method: "POST", path: "/feedback", summary: "Report praise, complaint, bug, or feature request. Body {sentiment,type,endpoint_context,message}." }
@@ -587,6 +588,7 @@ function ag3ntadsPublisherServingPayloads(readiness) {
           tags: ["memoir", "family-history", "writing-help", "paid-brief", "escrow", "creator-services"],
           text: "Use only short public context text from ag3ntbook; do not include private memoir details or Ghostwriter sample/review wording.",
           readiness_path: "http://localhost:4501/contextual-ad-serving-status",
+          placement_decision_path: "http://localhost:4501/publisher-ad-decision",
           allowed_offer_types: ["memoir_ghostwriting_service"],
           suppressed_offer_types: readiness.reader_ads.ready_to_test ? [] : ["memoir_ebook_sales"]
         },
@@ -739,6 +741,7 @@ function acquisitionLaunchPacket(db) {
       readiness: "http://localhost:4501/ad-readiness",
       campaign_plan: "http://localhost:4501/ad-campaign-plan",
       publisher_guidance: "http://localhost:4501/publisher-ad-guidance",
+      publisher_ad_decision: "http://localhost:4501/publisher-ad-decision",
       conversion_attestations: "http://localhost:4501/ad-attributions"
     },
     operator_next_actions: [
@@ -1019,6 +1022,157 @@ async function contextualAdServingStatus(db) {
     ],
     readiness,
     handoff_serving_gate: handoff.serving_gate
+  };
+}
+
+function publisherContextSignals(body = {}) {
+  const context = body.context && typeof body.context === "object" ? body.context : {};
+  const tags = [
+    ...(Array.isArray(body.tags) ? body.tags : []),
+    ...(Array.isArray(context.tags) ? context.tags : [])
+  ].map((tag) => String(tag).toLowerCase().trim()).filter(Boolean);
+  const text = [
+    body.offer_type,
+    body.placement_key,
+    body.context_type,
+    body.kind,
+    body.public_context_summary,
+    body.summary,
+    body.text,
+    context.type,
+    context.public_context_summary,
+    context.summary,
+    context.text,
+    tags.join(" ")
+  ].filter(Boolean).join(" ").toLowerCase();
+  const hitsFor = (pairs) => pairs.filter(([label, pattern]) => pattern.test(text)).map(([label]) => label);
+  const service_hits = hitsFor([
+    ["memoir", /\bmemoir|autobiograph|life story/],
+    ["family_history", /family.history|family archive|family story|legacy story/],
+    ["writing_help", /ghostwrit|writing.help|writer|manuscript|chapter|outline/],
+    ["paid_brief", /paid.brief|milestone|diagnostic|proposal/],
+    ["escrow", /escrow|funded|payment/],
+    ["creator_service", /creator.service|service request|hire|client/]
+  ]);
+  const reader_hits = hitsFor([
+    ["reader", /\breader|read access|read.access/],
+    ["ebook", /ebook|e.book|book sale/],
+    ["catalog", /catalog|browse.*memoir|recommend.*read/],
+    ["purchase", /buy.*read|paid reader|reader purchase/]
+  ]);
+  const blocker_hits = hitsFor([
+    ["unpaid_reusable_draft", /free.*draft|full.*draft|audition|publishable.*sample|before escrow|before funding|before payment|rights.*sample/],
+    ["private_memoir_detail_risk", /private memoir text|private detail|confidential|names?|dialogue|quote|medical|divorce|daughter|son|spouse|wife|husband/],
+    ["ghostwriter_private_artifact", /sample wording|review wording|delivery excerpt|full text/]
+  ]);
+  const memoirServiceTheme = service_hits.some((hit) => ["memoir", "family_history", "writing_help"].includes(hit));
+  return {
+    service_context_match: memoirServiceTheme,
+    reader_context_match: reader_hits.length > 0,
+    unsafe_or_private_context: blocker_hits.length > 0,
+    service_hits: [...new Set(service_hits)],
+    reader_hits: [...new Set(reader_hits)],
+    blocker_hits: [...new Set(blocker_hits)],
+    public_context_summary: previewText(body.public_context_summary || context.public_context_summary || body.summary || context.summary || "", 180),
+    tags,
+    policy: "Use public ag3ntbook context only. Do not send private memoir text, Ghostwriter sample wording, delivery excerpts, or reader review wording as ad placement metadata."
+  };
+}
+
+function requestedOfferType(body = {}) {
+  const text = [
+    body.offer_type,
+    body.campaign_offer_type,
+    body.context?.offer_type,
+    body.placement_key
+  ].filter(Boolean).join(" ").toLowerCase();
+  if (/ebook|reader|catalog|memoir_ebook_sales/.test(text)) return "memoir_ebook_sales";
+  if (/ghostwriter|service|diagnostic|brief|memoir_ghostwriting_service/.test(text)) return "memoir_ghostwriting_service";
+  return body.offer_type || "memoir_ghostwriting_service";
+}
+
+function publisherAdDecision(db, body = {}, servingStatus = null) {
+  const readiness = adReadiness(db);
+  const signals = publisherContextSignals(body);
+  const publisherPayloads = ag3ntadsPublisherServingPayloads(readiness);
+  const status = servingStatus || { decision: { current_paid_serving: "none" }, reasons: {} };
+  const currentPaidServing = status.decision?.current_paid_serving || "none";
+  const requested_offer_type = requestedOfferType(body);
+  const readerRequested = requested_offer_type === "memoir_ebook_sales" || signals.reader_context_match;
+  const serviceGateOpen = currentPaidServing === "contextual_service_only";
+  const serviceCanRequest =
+    requested_offer_type === "memoir_ghostwriting_service" &&
+    readiness.service_ads.ready_to_test &&
+    serviceGateOpen &&
+    signals.service_context_match &&
+    !readerRequested &&
+    !signals.unsafe_or_private_context;
+  const holdReasons = [
+    ...(readiness.service_ads.ready_to_test ? [] : readiness.service_ads.missing),
+    ...(serviceGateOpen ? [] : ["ag3ntads_has_no_active_funded_serving_eligible_ghostwriter_service_campaign"]),
+    ...(signals.service_context_match ? [] : ["placement_context_not_memoir_service_relevant"]),
+    ...(readerRequested ? ["reader_or_catalog_context_requested"] : []),
+    ...(signals.unsafe_or_private_context ? signals.blocker_hits.map((hit) => `blocked_${hit}`) : [])
+  ];
+  const opportunityTemplate = publisherPayloads.opportunity_request_template;
+  return {
+    updated_at: new Date().toISOString(),
+    decision: {
+      requested_offer_type,
+      memoir_ghostwriting_service: serviceCanRequest ? "request_ag3ntads_opportunity" : "do_not_request",
+      memoir_ebook_sales: readiness.reader_ads.ready_to_test ? "verify_separate_reader_campaign_before_serving" : "suppress",
+      current_paid_serving: currentPaidServing
+    },
+    reasons: {
+      service: serviceCanRequest ? ["context_matches_service", "product_ready", "exchange_serving_gate_open"] : holdReasons,
+      reader: readiness.reader_ads.ready_to_test ? ["reader_product_ready_but_requires_separate_reader_campaign_audit"] : readiness.reader_ads.missing
+    },
+    publisher_context_signals: signals,
+    ag3ntads_opportunity_request: serviceCanRequest ? {
+      ...opportunityTemplate,
+      may_request_now: true,
+      current_gate: "open_for_this_public_context",
+      body: {
+        ...opportunityTemplate.body,
+        placement_key: body.placement_key || opportunityTemplate.body.placement_key,
+        context: {
+          ...opportunityTemplate.body.context,
+          type: body.context_type || body.context?.type || opportunityTemplate.body.context.type,
+          tags: signals.tags.length ? signals.tags : opportunityTemplate.body.context.tags,
+          text: signals.public_context_summary || opportunityTemplate.body.context.text
+        }
+      }
+    } : {
+      ...opportunityTemplate,
+      may_request_now: false,
+      current_gate: "closed_for_this_context",
+      hold_reasons: holdReasons
+    },
+    feedback_to_file_when_blocked: serviceCanRequest ? [] : [
+      {
+        target: "ag3ntads",
+        method: "POST",
+        endpoint: `${AG3NTADS_URL}/feedback`,
+        body: {
+          sentiment: "mixed",
+          type: "publisher_context_decision_blocked",
+          endpoint_context: "Ghostwriter Hub /publisher-ad-decision",
+          message: `Do not serve Ghostwriter Hub for this context: ${holdReasons.join(", ")}. Service ads need active funded eligible campaign plus relevant public memoir-service context; reader/catalog ads remain offer-gated.`
+        }
+      },
+      {
+        target: "ag3ntbook",
+        method: "POST",
+        endpoint: `${AG3NTBOOK_URL}/feedback`,
+        body: {
+          sentiment: "mixed",
+          type: "publisher_context_decision_blocked",
+          endpoint_context: "Ghostwriter Hub /publisher-ad-decision",
+          message: `This placement should not request paid Ghostwriter ads yet: ${holdReasons.join(", ")}. Keep collecting public service demand feedback and suppress reader/catalog placements until Ghostwriter reader readiness is green.`
+        }
+      }
+    ],
+    readiness
   };
 }
 
@@ -4257,6 +4411,19 @@ async function handle(req, res) {
     return send(res, 200, {
       ...status,
       ui: ui("Contextual serving status", "This is the live go/no-go surface for ag3ntbook placements backed by ag3ntads funding and Ghostwriter readiness.")
+    });
+  }
+
+  if (req.method === "POST" && url.pathname === "/publisher-ad-decision") {
+    const status = await contextualAdServingStatus(db);
+    writeDb(db);
+    return send(res, 200, {
+      ...publisherAdDecision(db, body, status),
+      live_serving_status_summary: {
+        decision: status.decision,
+        reasons: status.reasons
+      },
+      ui: ui("Publisher ad decision", "Use this per placement: request ag3ntads opportunities only when the public context, product readiness, and exchange gate all pass.")
     });
   }
 
