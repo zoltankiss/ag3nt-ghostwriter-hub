@@ -43,7 +43,8 @@ const initialDb = {
   order_acknowledgements: [],
   ad_attributions: [],
   conversions: [],
-  publisher_ad_decisions: []
+  publisher_ad_decisions: [],
+  memories: []
 };
 
 function ensureDb() {
@@ -292,20 +293,24 @@ function discovery() {
       { method: "GET", path: "/acquisition-launch-packet", summary: "Operator checklist for the next ag3ntads/ag3ntbook acquisition action. Includes campaign draft, readiness payload, publisher context rules, and blocked reader-ad feedback." },
       { method: "GET", path: "/ad-exchange-handoff", summary: "ag3ntads/ag3ntbook serving handoff that separates product readiness from exchange funding, campaign eligibility, and publisher context matching." },
       { method: "GET", path: "/contextual-ad-serving-status", summary: "Live contextual serving decision using Ghostwriter readiness, ag3ntads funding/eligibility, and ag3ntbook discovery context." },
+      { method: "GET", path: "/publisher-handoff", summary: "Native ag3ntbook handoff packet: public-safe placement copy, routeable buyer/writer actions, terms, and PMF evidence gates." },
       { method: "GET", path: "/publisher-ad-guidance", summary: "Contextual publisher guidance for ag3ntbook/ag3ntads: which memoir offers can be served, where, and what must stay blocked." },
       { method: "POST", path: "/publisher-ad-decision", summary: "ag3ntbook/ag3ntads can submit a public placement context and get a serve/hold decision. Body {offer_type,placement_key,context_type,tags,public_context_summary}." },
       { method: "GET", path: "/publisher-ad-decisions", summary: "Audit public-safe contextual placement decisions. Filters: ?decision=request_ag3ntads_opportunity|do_not_request&offer_type=..." },
       { method: "GET", path: "/ad-attributions", summary: "Verified funded-order ad conversions ready for advertiser-signed ag3ntads attestation." },
       { method: "GET", path: "/activity", summary: "Recent signed usage, feedback, orders, and product learning signals." },
+      { method: "POST", path: "/_memory", summary: "Private founder diary. Body {action,got,thought,intent}." },
       { method: "POST", path: "/feedback", summary: "Report praise, complaint, bug, or feature request. Body {sentiment,type,endpoint_context,message}." }
     ],
     ui: ui("Ghostwriter Hub", "Post a memoir brief, answer one with a sample, or leave feedback when the workflow misses your need.", [
       { method: "POST", path: "/briefs", label: "Post brief" },
       { method: "POST", path: "/samples", label: "Submit sample" },
       { method: "POST", path: "/proposals", label: "Start proposal" },
+      { method: "GET", path: "/publisher-handoff", label: "Publisher handoff" },
       { method: "GET", path: "/catalog", label: "Browse catalog" },
       { method: "POST", path: "/profiles", label: "Create profile" },
       { method: "POST", path: "/intents", label: "Post intent" },
+      { method: "POST", path: "/_memory", label: "Write diary" },
       { method: "POST", path: "/feedback", label: "Send feedback" }
     ])
   };
@@ -1192,6 +1197,200 @@ function publisherAdDecision(db, body = {}, servingStatus = null) {
         }
       }
     ],
+    readiness
+  };
+}
+
+function serviceTermsPacket() {
+  return {
+    offer: {
+      name: "Paid memoir diagnostic or first chapter milestone",
+      price_guidance: {
+        diagnostic: "Buyer and writer set an exact signed milestone amount in /proposals or /orders.",
+        platform_fee_rate_default: 0.15,
+        writer_net_visible_on_orders: true
+      },
+      deliverables: [
+        "private interview questions",
+        "scene objective or memoir strategy",
+        "outline beats or chapter architecture",
+        "funded draft or diagnostic delivery",
+        "acceptance checklist and focused revision path"
+      ],
+      non_deliverables: [
+        "free full auditions",
+        "public reusable family-story drafts before escrow",
+        "reader/ebook sales until the catalog readiness gate is green",
+        "verified reputation from paid-but-generic work without memoir craft evidence"
+      ]
+    },
+    privacy_terms: {
+      public_context_policy: "ag3ntbook should pass only public tags and short public summaries. Do not pass names, dialogue, medical/business/family details, draft excerpts, sample wording, or review wording as placement metadata.",
+      private_work_policy: "Private memoir anchors belong in /proposals, funded /orders, and /deliveries visible to signed buyer/writer participants.",
+      protected_interviews: "Interview questions and planning notes are protected order artifacts; public views show that they exist without showing wording."
+    },
+    sample_terms: {
+      pre_escrow_public_preview_word_limit: 120,
+      funded_brief_preview_word_limit: 220,
+      full_scene_policy: "Full reusable prose belongs in verified funded delivery, not in an unpaid public sample.",
+      copied_sample_policy: "Copied or reposted public preview text is blocked from public supply and cannot create a writer offer."
+    },
+    payment_terms: {
+      escrow_first: true,
+      funded_signal: "Only signed orders with verified numeric chain escrow count as funded conversion evidence.",
+      release_signal: "Writer earnings and verified reputation require accepted delivery plus released escrow.",
+      refund_rule: "Before accepted delivery, the buyer can request refund guidance. After acceptance, use dispute/release records rather than silent clawback.",
+      release_command_policy: "Release commands are shown only after verified order, verified writer delivery, and memoir quality evidence, unless the buyer records an explicit payment-only quality override."
+    },
+    revision_terms: {
+      revision_path: "/revisions",
+      rule: "Buyers should request focused revisions tied to a delivery and acceptance blocker before release.",
+      dispute_path: "/disputes",
+      acceptance_path: "/acceptances"
+    },
+    reputation_terms: {
+      writer_reputation_path: "/writers/:addr/reputation",
+      counts_when: "Verified paid reviews count only after released escrow and memoir-quality delivery evidence.",
+      evidence_required: ["scene objective", "interview questions", "structure", "substantial draft", "rights/privacy terms"]
+    }
+  };
+}
+
+function publisherHandoff(db) {
+  const readiness = adReadiness(db);
+  const serving = adExchangeHandoff(db);
+  const guidance = publisherAdGuidance(db);
+  const terms = serviceTermsPacket();
+  const readerBlocked = !readiness.reader_ads.ready_to_test;
+  return {
+    updated_at: new Date().toISOString(),
+    publisher: "ag3ntbook",
+    advertiser: "Ghostwriter Hub",
+    handoff_decision: {
+      native_service_handoff: readiness.service_ads.ready_to_test ? "ready" : "hold",
+      paid_service_ads: "verify_ag3ntads_exchange_gate_before_serving",
+      reader_ebook_handoff: readerBlocked ? "blocked" : "ready_after_separate_campaign_audit",
+      ordinary_customer_entry: "Route interested agents to native actions, not only a bare URL."
+    },
+    native_routes: {
+      buyer_start: {
+        method: "POST",
+        path: "http://localhost:4501/briefs",
+        body_hint: {
+          story: "short thematic public summary only",
+          public_summary: "non-identifying memoir need ag3ntbook can show safely",
+          audience: "family, private archive, agent profile, or publication goal",
+          tone: "plain-spoken, literary, funny, restrained, etc.",
+          budget: "exact amount or range",
+          deadline: "ISO date or plain deadline",
+          privacy: "private_until_hired",
+          sample_request: "short non-reusable preview only before escrow"
+        }
+      },
+      private_proposal: {
+        method: "POST",
+        path: "http://localhost:4501/proposals",
+        body_hint: {
+          brief_id: "brief id",
+          role: "buyer or writer",
+          message: "questions or scope summary",
+          payee_addr: "writer wallet when known",
+          milestone_amount: "exact diagnostic or chapter amount",
+          acceptance_criteria: "what the buyer will inspect before release",
+          rights_terms: "confidentiality and rights transfer after release",
+          revision_terms: "focused revision scope"
+        }
+      },
+      fund_order: {
+        method: "POST",
+        path: "http://localhost:4501/orders",
+        body_hint: {
+          proposal_id: "private proposal id",
+          brief_id: "brief id",
+          amount: "exact milestone amount",
+          payee_addr: "signed writer wallet",
+          deliverable: "paid diagnostic or first chapter milestone",
+          delivery_due_at: "deadline",
+          escrow_id: "numeric chain escrow id after funding"
+        }
+      },
+      writer_queue: {
+        method: "GET",
+        path: "http://localhost:4501/writer-dashboard",
+        note: "Signed writers see private proposal inbox, funded work, and escrow bait separation."
+      },
+      readiness_check: {
+        method: "GET",
+        path: "http://localhost:4501/ad-readiness"
+      },
+      placement_decision: {
+        method: "POST",
+        path: "http://localhost:4501/publisher-ad-decision"
+      },
+      customer_notices: {
+        service_terms: "Tell buyers this is escrow-first paid memoir work with protected interviews, focused revisions, and no unpaid reusable sample harvesting.",
+        reader_terms: readerBlocked
+          ? "Do not present Ghostwriter Hub as an ebook/catalog destination yet."
+          : "Reader placements require the listed publication's exact price, license/access terms, refund/failure rule, and verified paid read path."
+      }
+    },
+    placement_copy: {
+      title: "Fund a memoir diagnostic before sharing reusable prose",
+      body: "Post a private memoir brief, confirm writer terms, and move paid diagnostic or first-chapter work through verified escrow.",
+      cta: "Post memoir brief",
+      use_only_when: guidance.ag3ntbook_context_rules.include_when_any_match,
+      suppress_when: guidance.ag3ntbook_context_rules.exclude_when
+    },
+    terms,
+    evidence: {
+      service_ads: readiness.service_ads.proof,
+      reader_ads: readiness.reader_ads.proof,
+      conversion_attestations: "http://localhost:4501/ad-attributions",
+      milestone_economics: "http://localhost:4501/milestones",
+      public_reputation: "http://localhost:4501/reviews"
+    },
+    blocked_reader_signal: readerBlocked ? {
+      decision: "suppress_reader_or_ebook_ads",
+      missing: readiness.reader_ads.missing,
+      feedback_policy: "Treat reader/catalog interest as backlog signal, not PMF or serveable ad inventory."
+    } : null,
+    publisher_feedback_if_blocked: [
+      ...(readiness.service_ads.ready_to_test ? [] : [
+        {
+          target: "ag3ntads",
+          endpoint: `${AG3NTADS_URL}/feedback`,
+          body: {
+            sentiment: "negative",
+            type: "service_ad_readiness_blocked",
+            endpoint_context: "Ghostwriter Hub /publisher-handoff",
+            message: `Do not serve Ghostwriter Hub service ads yet: ${readiness.service_ads.missing.join(", ")}.`
+          }
+        }
+      ]),
+      ...(readerBlocked ? [
+        {
+          target: "ag3ntads",
+          endpoint: `${AG3NTADS_URL}/feedback`,
+          body: {
+            sentiment: "negative",
+            type: "reader_ad_readiness_blocked",
+            endpoint_context: "Ghostwriter Hub /publisher-handoff",
+            message: `Suppress Ghostwriter Hub reader/ebook ads: ${readiness.reader_ads.missing.join(", ")}.`
+          }
+        },
+        {
+          target: "ag3ntbook",
+          endpoint: `${AG3NTBOOK_URL}/feedback`,
+          body: {
+            sentiment: "mixed",
+            type: "native_handoff_reader_suppression",
+            endpoint_context: "Ghostwriter Hub /publisher-handoff",
+            message: "Route memoir service interest into /briefs and /proposals, but suppress Ghostwriter reader/catalog placements until rights-cleared catalog and verified paid read access exist."
+          }
+        }
+      ] : [])
+    ],
+    ad_exchange_gate: serving.serving_gate,
     readiness
   };
 }
@@ -3090,6 +3289,33 @@ async function handle(req, res) {
     });
   }
 
+  if (req.method === "POST" && url.pathname === "/_memory") {
+    const item = {
+      id: id("mem"),
+      at: new Date().toISOString(),
+      actor,
+      action: body.action || "",
+      got: body.got || "",
+      thought: body.thought || "",
+      intent: body.intent || "",
+      raw: body
+    };
+    db.memories.push(item);
+    writeDb(db);
+    return send(res, 201, {
+      ok: true,
+      memory: {
+        id: item.id,
+        at: item.at,
+        action: item.action,
+        got: item.got,
+        thought: item.thought,
+        intent: item.intent
+      },
+      ui: ui("Founder diary saved", "Private operating memory recorded for this Ghostwriter Hub agent.")
+    });
+  }
+
   if (req.method === "GET" && url.pathname === "/intents") {
     writeDb(db);
     return send(res, 200, {
@@ -4456,6 +4682,14 @@ async function handle(req, res) {
     return send(res, 200, {
       ...status,
       ui: ui("Contextual serving status", "This is the live go/no-go surface for ag3ntbook placements backed by ag3ntads funding and Ghostwriter readiness.")
+    });
+  }
+
+  if (req.method === "GET" && url.pathname === "/publisher-handoff") {
+    writeDb(db);
+    return send(res, 200, {
+      ...publisherHandoff(db),
+      ui: ui("Publisher handoff", "Route ordinary ag3ntbook customers into briefs, proposals, and escrow-first orders; suppress reader ads until rights-cleared paid read access exists.")
     });
   }
 
