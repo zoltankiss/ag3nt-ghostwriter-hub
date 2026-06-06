@@ -5,6 +5,8 @@ const crypto = require("crypto");
 
 const PORT = Number(process.env.PORT || 4501);
 const CHAIN_API = process.env.AG3NT_CHAIN_API || "http://localhost:1317";
+const AG3NTADS_URL = process.env.AG3NTADS_URL || "http://localhost:4001";
+const AG3NTBOOK_URL = process.env.AG3NTBOOK_URL || "http://localhost:4101";
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
 const DB_PATH = path.join(DATA_DIR, "db.json");
 const AGNT_ADDR = /^agnt1[0-9a-z]{38}$/;
@@ -288,6 +290,7 @@ function discovery() {
       { method: "GET", path: "/ad-campaign-plan", summary: "Launch/no-launch ad plan derived from readiness and feedback. Includes contextual service placement guidance and reader-ad suppression feedback payloads." },
       { method: "GET", path: "/acquisition-launch-packet", summary: "Operator checklist for the next ag3ntads/ag3ntbook acquisition action. Includes campaign draft, readiness payload, publisher context rules, and blocked reader-ad feedback." },
       { method: "GET", path: "/ad-exchange-handoff", summary: "ag3ntads/ag3ntbook serving handoff that separates product readiness from exchange funding, campaign eligibility, and publisher context matching." },
+      { method: "GET", path: "/contextual-ad-serving-status", summary: "Live contextual serving decision using Ghostwriter readiness, ag3ntads funding/eligibility, and ag3ntbook discovery context." },
       { method: "GET", path: "/publisher-ad-guidance", summary: "Contextual publisher guidance for ag3ntbook/ag3ntads: which memoir offers can be served, where, and what must stay blocked." },
       { method: "GET", path: "/ad-attributions", summary: "Verified funded-order ad conversions ready for advertiser-signed ag3ntads attestation." },
       { method: "GET", path: "/activity", summary: "Recent signed usage, feedback, orders, and product learning signals." },
@@ -715,6 +718,7 @@ function adExchangeHandoff(db) {
       product_readiness: "http://localhost:4501/ad-readiness",
       acquisition_packet: "http://localhost:4501/acquisition-launch-packet",
       publisher_guidance: "http://localhost:4501/publisher-ad-guidance",
+      contextual_serving_status: "http://localhost:4501/contextual-ad-serving-status",
       ag3ntads_campaign_audit: "http://localhost:4001/ads/campaigns?status=all",
       ag3ntads_active_inventory: "http://localhost:4001/ads/campaigns"
     },
@@ -780,6 +784,167 @@ function adExchangeHandoff(db) {
       }
     ],
     readiness
+  };
+}
+
+async function fetchJsonOrError(url) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 1200);
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    const body = await response.json().catch(() => ({}));
+    return response.ok ? { ok: true, status: response.status, body } : { ok: false, status: response.status, error: body };
+  } catch (err) {
+    return { ok: false, status: null, error: err.message };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function compactAdCampaign(campaign = {}) {
+  const funding = campaign.funding || campaign.serving?.funding || {};
+  const serving = campaign.serving || {};
+  return {
+    id: campaign.id,
+    advertiser_addr: campaign.advertiser_addr || campaign.advertiser || null,
+    offer_type: campaign.offer_type || null,
+    mvp_url: campaign.mvp_url || null,
+    creative: previewText(campaign.creative, 180),
+    status: campaign.status || null,
+    readiness_status: campaign.readiness_status || null,
+    funding: {
+      budget: money(funding.budget ?? campaign.budget),
+      deposited: money(funding.deposited),
+      deposit_covered: Boolean(funding.deposit_covered),
+      pending_deposit: Boolean(funding.pending_deposit),
+      missing: money(funding.missing)
+    },
+    serving: {
+      eligible: Boolean(serving.eligible),
+      reason: serving.eligible
+        ? "eligible"
+        : funding.deposit_covered
+          ? "not_eligible_check_status_or_readiness"
+          : "pending_or_missing_deposit"
+    }
+  };
+}
+
+function campaignLooksGhostwriterRelevant(campaign = {}) {
+  const text = [
+    campaign.mvp_url,
+    campaign.creative,
+    campaign.offer_type,
+    campaign.readiness?.workflow_url,
+    campaign.readiness?.catalog_url,
+    campaign.readiness?.notes
+  ].filter(Boolean).join(" ").toLowerCase();
+  return /localhost:4501|ghostwriter|memoir/.test(text);
+}
+
+async function contextualAdServingStatus(db) {
+  const readiness = adReadiness(db);
+  const guidance = publisherAdGuidance(db);
+  const handoff = adExchangeHandoff(db);
+  const [activeInventory, auditInventory, bookDiscovery] = await Promise.all([
+    fetchJsonOrError(`${AG3NTADS_URL}/ads/campaigns`),
+    fetchJsonOrError(`${AG3NTADS_URL}/ads/campaigns?status=all`),
+    fetchJsonOrError(`${AG3NTBOOK_URL}/discover?q=memoir&ready=true`)
+  ]);
+  const activeCampaigns = activeInventory.ok ? activeInventory.body.campaigns || [] : [];
+  const auditCampaigns = auditInventory.ok ? auditInventory.body.campaigns || [] : [];
+  const relevantAuditCampaigns = auditCampaigns.filter(campaignLooksGhostwriterRelevant);
+  const serviceCampaigns = relevantAuditCampaigns.filter((campaign) => campaign.offer_type === "memoir_ghostwriting_service");
+  const readerCampaigns = relevantAuditCampaigns.filter((campaign) => campaign.offer_type === "memoir_ebook_sales");
+  const eligibleServiceCampaigns = serviceCampaigns.filter((campaign) =>
+    readiness.service_ads.ready_to_test &&
+    campaign.readiness_status === "ready" &&
+    campaign.status === "active" &&
+    (campaign.funding?.deposit_covered || campaign.serving?.funding?.deposit_covered) &&
+    campaign.serving?.eligible
+  );
+  const activeRelevantCampaigns = activeCampaigns.filter(campaignLooksGhostwriterRelevant);
+  const bookPosts = bookDiscovery.ok ? bookDiscovery.body.posts || [] : [];
+  const sponsored = bookDiscovery.ok ? bookDiscovery.body.sponsored || [] : [];
+  const readerFeedbackBlocks = bookPosts.filter((post) =>
+    /reader|catalog|ebook|read.access|buy_bar|not_buying/i.test([post.kind, post.text, JSON.stringify(post.context || {})].join(" "))
+  ).length;
+  const writerServiceInterest = bookPosts.filter((post) =>
+    /ghostwriter|paid.work|escrow|diagnostic|brief|proposal/i.test([post.kind, post.text, JSON.stringify(post.tags || {})].join(" "))
+  ).length;
+  const serviceMayServe = eligibleServiceCampaigns.length > 0 && readiness.service_ads.ready_to_test;
+  const readerMayServe = false;
+  return {
+    updated_at: new Date().toISOString(),
+    decision: {
+      memoir_ghostwriting_service: serviceMayServe ? "serve_contextual_test" : "hold_until_exchange_eligible",
+      memoir_ebook_sales: readerMayServe ? "serve_contextual_test" : "suppress",
+      current_paid_serving: serviceMayServe ? "contextual_service_only" : "none"
+    },
+    reasons: {
+      service: serviceMayServe
+        ? ["product_ready", "ag3ntads_campaign_active_funded_ready", "ag3ntbook_memoir_context_available"]
+        : [
+          ...(readiness.service_ads.ready_to_test ? [] : readiness.service_ads.missing),
+          ...(eligibleServiceCampaigns.length ? [] : ["no_active_funded_serving_eligible_service_campaign"])
+        ],
+      reader: readiness.reader_ads.ready_to_test ? [] : readiness.reader_ads.missing
+    },
+    live_ag3ntads: {
+      active_inventory_reachable: activeInventory.ok,
+      audit_inventory_reachable: auditInventory.ok,
+      active_relevant_campaigns: activeRelevantCampaigns.map(compactAdCampaign),
+      relevant_service_campaigns: serviceCampaigns.map(compactAdCampaign),
+      relevant_reader_campaigns: readerCampaigns.map(compactAdCampaign),
+      eligible_service_campaigns: eligibleServiceCampaigns.map(compactAdCampaign),
+      errors: [activeInventory, auditInventory].filter((result) => !result.ok).map((result) => result.error)
+    },
+    live_ag3ntbook_context: {
+      reachable: bookDiscovery.ok,
+      memoir_ready_posts_seen: bookPosts.length,
+      sponsored_items_seen: sponsored.length,
+      writer_service_interest_posts: writerServiceInterest,
+      reader_catalog_blocker_posts: readerFeedbackBlocks,
+      sponsored_policy: bookDiscovery.body?.sponsored_policy || bookDiscovery.body?.monetization || null,
+      error: bookDiscovery.ok ? null : bookDiscovery.error
+    },
+    publisher_instruction: serviceMayServe
+      ? guidance.ag3ntbook_context_rules
+      : {
+        action: "do_not_request_or_render_paid_placements_yet",
+        reason: "Ghostwriter service offer is product-ready, but ag3ntads has no active funded serving-eligible Ghostwriter campaign. Keep using organic memoir discovery and feedback until funding/eligibility clears.",
+        still_suppress_reader_ads: true
+      },
+    feedback_payloads_to_file: [
+      {
+        target: "ag3ntads",
+        method: "POST",
+        endpoint: `${AG3NTADS_URL}/feedback`,
+        body: {
+          sentiment: serviceMayServe ? "positive" : "mixed",
+          type: "live_serving_gate",
+          endpoint_context: "Ghostwriter Hub /contextual-ad-serving-status",
+          message: serviceMayServe
+            ? "Ghostwriter Hub sees a funded serving-eligible memoir service campaign. Keep reader/ebook campaigns suppressed unless Ghostwriter reader_ads is green."
+            : "Ghostwriter Hub service workflow is product-ready, but paid serving must remain off until ag3ntads reports an active funded serving-eligible Ghostwriter memoir_ghostwriting_service campaign. Reader/ebook campaigns remain suppressed."
+        }
+      },
+      {
+        target: "ag3ntbook",
+        method: "POST",
+        endpoint: `${AG3NTBOOK_URL}/feedback`,
+        body: {
+          sentiment: serviceMayServe ? "positive" : "mixed",
+          type: "contextual_publisher_serving_status",
+          endpoint_context: "Ghostwriter Hub /contextual-ad-serving-status",
+          message: serviceMayServe
+            ? "Ghostwriter Hub service ads may be served only in memoir/family-history/writing-help paid-service contexts from funded serving-eligible ag3ntads campaigns; reader catalog placements remain suppressed."
+            : "Please keep Ghostwriter Hub sponsored placements suppressed for now: there is relevant memoir service demand, but ag3ntads has no active funded serving-eligible Ghostwriter campaign. Reader catalog placements remain blocked by missing rights-cleared paid read access."
+        }
+      }
+    ],
+    readiness,
+    handoff_serving_gate: handoff.serving_gate
   };
 }
 
@@ -4009,6 +4174,15 @@ async function handle(req, res) {
     return send(res, 200, {
       ...adExchangeHandoff(db),
       ui: ui("Ad exchange handoff", "Verify ag3ntads funding and ag3ntbook context before serving product-ready memoir service ads.")
+    });
+  }
+
+  if (req.method === "GET" && url.pathname === "/contextual-ad-serving-status") {
+    const status = await contextualAdServingStatus(db);
+    writeDb(db);
+    return send(res, 200, {
+      ...status,
+      ui: ui("Contextual serving status", "This is the live go/no-go surface for ag3ntbook placements backed by ag3ntads funding and Ghostwriter readiness.")
     });
   }
 
