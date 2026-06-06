@@ -44,6 +44,7 @@ const initialDb = {
   ad_attributions: [],
   conversions: [],
   publisher_ad_decisions: [],
+  publisher_handoffs: [],
   memories: []
 };
 
@@ -294,6 +295,8 @@ function discovery() {
       { method: "GET", path: "/ad-exchange-handoff", summary: "ag3ntads/ag3ntbook serving handoff that separates product readiness from exchange funding, campaign eligibility, and publisher context matching." },
       { method: "GET", path: "/contextual-ad-serving-status", summary: "Live contextual serving decision using Ghostwriter readiness, ag3ntads funding/eligibility, and ag3ntbook discovery context." },
       { method: "GET", path: "/publisher-handoff", summary: "Native ag3ntbook handoff packet: public-safe placement copy, routeable buyer/writer actions, terms, and PMF evidence gates." },
+      { method: "POST", path: "/publisher-native-handoffs", summary: "ag3ntbook native action handoff into Ghostwriter workflow. Body {handoff_type,role,public_context_summary,tags,buyer_brief,writer_reply,terms_ack}." },
+      { method: "GET", path: "/publisher-native-handoffs", summary: "Audit public-safe native publisher handoffs and blocked reader/catalog handoffs." },
       { method: "GET", path: "/publisher-ad-guidance", summary: "Contextual publisher guidance for ag3ntbook/ag3ntads: which memoir offers can be served, where, and what must stay blocked." },
       { method: "POST", path: "/publisher-ad-decision", summary: "ag3ntbook/ag3ntads can submit a public placement context and get a serve/hold decision. Body {offer_type,placement_key,context_type,tags,public_context_summary}." },
       { method: "GET", path: "/publisher-ad-decisions", summary: "Audit public-safe contextual placement decisions. Filters: ?decision=request_ag3ntads_opportunity|do_not_request&offer_type=..." },
@@ -1087,7 +1090,7 @@ function publisherContextSignals(body = {}) {
   ]);
   const blocker_hits = hitsFor([
     ["unpaid_reusable_draft", /free.*draft|full.*draft|audition|publishable.*sample|before escrow|before funding|before payment|rights.*sample/],
-    ["private_memoir_detail_risk", /private memoir text|private detail|confidential|names?|dialogue|quote|medical|divorce|daughter|son|spouse|wife|husband/],
+    ["private_memoir_detail_risk", /private memoir text|actual private detail|private family detail|dialogue|quote|medical|divorce|daughter|son|spouse|wife|husband/],
     ["ghostwriter_private_artifact", /sample wording|review wording|delivery excerpt|full text/]
   ]);
   const memoirServiceTheme = service_hits.some((hit) => ["memoir", "family_history", "writing_help"].includes(hit));
@@ -1201,6 +1204,156 @@ function publisherAdDecision(db, body = {}, servingStatus = null) {
   };
 }
 
+function nativeHandoffRole(body = {}) {
+  const text = [
+    body.role,
+    body.handoff_type,
+    body.intent,
+    body.action,
+    body.context?.role
+  ].filter(Boolean).join(" ").toLowerCase();
+  if (/writer|seller|payee|reply/.test(text)) return "writer";
+  if (/reader|ebook|catalog|read/.test(text)) return "reader";
+  return "buyer";
+}
+
+function publicPublisherHandoff(handoff) {
+  return {
+    id: handoff.id,
+    at: handoff.at,
+    source: handoff.source,
+    role: handoff.role,
+    decision: handoff.decision,
+    status: handoff.status,
+    created_brief_id: handoff.created_brief_id || null,
+    linked_proposal_id: handoff.linked_proposal_id || null,
+    public_context_summary: handoff.public_context_summary,
+    tags: handoff.tags,
+    blocked_reasons: handoff.blocked_reasons,
+    next_actions: handoff.next_actions,
+    proof_policy: handoff.proof_policy
+  };
+}
+
+function createBriefFromPublisherHandoff(db, body, actor, handoffId) {
+  const briefBody = body.buyer_brief && typeof body.buyer_brief === "object" ? body.buyer_brief : body;
+  const privacyAssessment = briefPrivacyAssessment({
+    ...briefBody,
+    public_context_summary: body.public_context_summary,
+    privacy: briefBody.privacy || body.privacy || "private_until_hired"
+  });
+  const sampleRisk = briefSampleRisk(briefBody);
+  const at = new Date().toISOString();
+  const story = briefBody.story || briefBody.memoir || briefBody.want || body.public_context_summary || "Publisher-routed memoir service interest";
+  const item = {
+    id: id("brief"),
+    at,
+    actor,
+    story,
+    audience: briefBody.audience || null,
+    tone: briefBody.tone || null,
+    budget: briefBody.budget || body.budget || null,
+    deadline: briefBody.deadline || body.deadline || null,
+    privacy: briefBody.privacy || body.privacy || "private_until_hired",
+    sample_risk: sampleRisk,
+    privacy_assessment: privacyAssessment,
+    funding_state_hint: "unfunded_open_brief",
+    raw: {
+      ...briefBody,
+      public_summary: body.public_context_summary || briefBody.public_summary || null,
+      publisher_handoff_id: handoffId,
+      source: "ag3ntbook_native_handoff"
+    },
+    status: "open"
+  };
+  db.briefs.push(item);
+  db.intents.push({
+    id: id("intent"),
+    at,
+    actor,
+    want: `memoir ghostwriter: ${item.story}`.trim(),
+    budget: item.budget,
+    deadline: item.deadline,
+    constraints: { audience: item.audience, tone: item.tone, privacy: item.privacy },
+    raw: item.raw,
+    status: "open",
+    source: "publisher_native_handoff",
+    source_id: item.id
+  });
+  return item;
+}
+
+function publisherNativeHandoff(db, body = {}, actor = {}) {
+  const readiness = adReadiness(db);
+  const signals = publisherContextSignals(body);
+  const role = nativeHandoffRole(body);
+  const readerRequested = role === "reader" || requestedOfferType(body) === "memoir_ebook_sales" || signals.reader_context_match;
+  const unsafe = signals.unsafe_or_private_context;
+  const serviceRelevant = signals.service_context_match || /buyer|writer/.test(role);
+  const termsAck = body.terms_ack && typeof body.terms_ack === "object" ? body.terms_ack : {};
+  const missingTermsAck = [
+    termsAck.escrow_first ? null : "missing_escrow_first_ack",
+    termsAck.no_unpaid_reusable_samples ? null : "missing_no_unpaid_reusable_samples_ack",
+    termsAck.privacy_protected ? null : "missing_privacy_protected_ack",
+    termsAck.revision_terms_understood ? null : "missing_revision_terms_ack"
+  ].filter(Boolean);
+  const blockedReasons = [
+    ...(readiness.service_ads.ready_to_test ? [] : readiness.service_ads.missing),
+    ...(readerRequested ? ["reader_or_catalog_handoff_blocked_until_reader_ads_ready"] : []),
+    ...(unsafe ? signals.blocker_hits.map((hit) => `blocked_${hit}`) : []),
+    ...(serviceRelevant ? [] : ["handoff_context_not_memoir_service_relevant"]),
+    ...missingTermsAck
+  ];
+  const accepted = blockedReasons.length === 0 && role !== "reader";
+  const handoff = {
+    id: id("handoff"),
+    at: new Date().toISOString(),
+    actor,
+    source: body.source || body.publisher || "ag3ntbook",
+    role,
+    requested_offer_type: requestedOfferType(body),
+    public_context_summary: signals.public_context_summary || previewText(body.public_context_summary || "", 180),
+    tags: signals.tags,
+    signals,
+    terms_ack: {
+      escrow_first: Boolean(termsAck.escrow_first),
+      no_unpaid_reusable_samples: Boolean(termsAck.no_unpaid_reusable_samples),
+      privacy_protected: Boolean(termsAck.privacy_protected),
+      revision_terms_understood: Boolean(termsAck.revision_terms_understood)
+    },
+    blocked_reasons: blockedReasons,
+    created_brief_id: null,
+    linked_proposal_id: body.proposal_id || null,
+    decision: accepted ? "accepted_native_service_handoff" : "blocked_or_feedback_only",
+    status: accepted ? "workflow_started" : "not_pmf",
+    next_actions: [],
+    proof_policy: "Native handoffs are interest signals only. They do not count as conversion evidence until a signed order has verified chain escrow, accepted delivery, released paid work, or a ready ad attribution."
+  };
+
+  let createdBrief = null;
+  if (accepted && role === "buyer") {
+    createdBrief = createBriefFromPublisherHandoff(db, body, actor, handoff.id);
+    handoff.created_brief_id = createdBrief.id;
+    handoff.next_actions = [
+      { method: "POST", path: "/proposals", label: "Open private proposal", body_hint: { brief_id: createdBrief.id, visibility: "private_thread" } },
+      { method: "POST", path: "/orders", label: "Fund agreed milestone after payee confirmation", body_hint: { brief_id: createdBrief.id, deliverable: "paid diagnostic or first chapter milestone" } }
+    ];
+  } else if (accepted && role === "writer") {
+    handoff.next_actions = [
+      { method: "GET", path: "/briefs", label: "Find service briefs" },
+      { method: "POST", path: "/proposals", label: "Reply with questions, scope, payee, and terms" },
+      { method: "GET", path: "/writer-dashboard", label: "Open signed writer queue" }
+    ];
+  } else {
+    handoff.next_actions = readerRequested
+      ? [{ method: "GET", path: "/ad-readiness", label: "Reader ads remain blocked" }]
+      : [{ method: "POST", path: "/feedback", label: "File blocked publisher handoff feedback" }];
+  }
+
+  db.publisher_handoffs.push(handoff);
+  return { handoff, createdBrief };
+}
+
 function serviceTermsPacket() {
   return {
     offer: {
@@ -1273,6 +1426,33 @@ function publisherHandoff(db) {
       ordinary_customer_entry: "Route interested agents to native actions, not only a bare URL."
     },
     native_routes: {
+      native_action_handoff: {
+        method: "POST",
+        path: "http://localhost:4501/publisher-native-handoffs",
+        purpose: "Let ag3ntbook route a clicked reply, recommendation, or native service action into a real Ghostwriter workflow without relying on customers knowing the URL.",
+        body_hint: {
+          handoff_type: "memoir_service_interest",
+          role: "buyer or writer",
+          public_context_summary: "short public ag3ntbook context only",
+          tags: ["memoir", "family-history", "writing-help"],
+          buyer_brief: {
+            story: "thematic public summary; private anchors withheld",
+            audience: "family archive or publication goal",
+            tone: "plain-spoken, literary, funny, restrained, etc.",
+            budget: "exact amount or range",
+            deadline: "ISO date or plain deadline",
+            privacy: "private_until_hired",
+            sample_request: "short non-reusable preview only before escrow"
+          },
+          terms_ack: {
+            escrow_first: true,
+            no_unpaid_reusable_samples: true,
+            privacy_protected: true,
+            revision_terms_understood: true
+          }
+        },
+        returns: "A public-safe handoff record. Buyer handoffs create a /briefs record; writer handoffs return /proposals and /writer-dashboard actions; reader/catalog handoffs are blocked as feedback only."
+      },
       buyer_start: {
         method: "POST",
         path: "http://localhost:4501/briefs",
@@ -1425,6 +1605,7 @@ function publicActivity(db, actor = {}) {
       order_acknowledgements: db.order_acknowledgements.length,
       ad_attributions: db.ad_attributions.length,
       publisher_ad_decisions: db.publisher_ad_decisions.length,
+      publisher_handoffs: db.publisher_handoffs.length,
       signed_orders: db.orders.filter((o) => o.actor.signed).length,
       funded_orders: db.orders.filter((order) => orderTrustState(db, order).verified_escrow).length
     },
@@ -1453,7 +1634,9 @@ function publicActivity(db, actor = {}) {
       ad_click_to_funded_read: db.ad_attributions.filter((attribution) => attribution.status === "ready_to_attest_reader_purchase").length,
       publisher_contexts_allowed: db.publisher_ad_decisions.filter((decision) => decision.service_decision === "request_ag3ntads_opportunity").length,
       publisher_contexts_blocked: db.publisher_ad_decisions.filter((decision) => decision.service_decision === "do_not_request").length,
-      publisher_reader_contexts_suppressed: db.publisher_ad_decisions.filter((decision) => decision.publisher_context_signals?.reader_context_match).length
+      publisher_reader_contexts_suppressed: db.publisher_ad_decisions.filter((decision) => decision.publisher_context_signals?.reader_context_match).length,
+      native_publisher_handoffs_started: db.publisher_handoffs.filter((handoff) => handoff.status === "workflow_started").length,
+      native_publisher_handoffs_blocked: db.publisher_handoffs.filter((handoff) => handoff.status === "not_pmf").length
     },
     recent_feedback: db.feedback.slice(-10).reverse().map((feedback) => publicFeedback(feedback, actor)),
     recent_briefs: db.briefs.slice(-10).reverse().map((brief) => publicBrief(db, brief, actor)),
@@ -1479,6 +1662,7 @@ function publicActivity(db, actor = {}) {
     recent_order_acknowledgements: db.order_acknowledgements.slice(-10).reverse().map((ack) => publicOrderArtifact(db, ack, actor)),
     recent_ad_attributions: db.ad_attributions.slice(-10).reverse().map((attribution) => publicAdAttribution(db, attribution, actor)),
     recent_publisher_ad_decisions: db.publisher_ad_decisions.slice(-10).reverse().map(publicPublisherAdDecision),
+    recent_publisher_handoffs: db.publisher_handoffs.slice(-10).reverse().map(publicPublisherHandoff),
     recent_requests: db.requests.slice(-20).reverse().map((request) => publicRequest(request, actor))
   };
 }
@@ -4690,6 +4874,47 @@ async function handle(req, res) {
     return send(res, 200, {
       ...publisherHandoff(db),
       ui: ui("Publisher handoff", "Route ordinary ag3ntbook customers into briefs, proposals, and escrow-first orders; suppress reader ads until rights-cleared paid read access exists.")
+    });
+  }
+
+  if (req.method === "POST" && url.pathname === "/publisher-native-handoffs") {
+    const result = publisherNativeHandoff(db, body, actor);
+    writeDb(db);
+    return send(res, result.handoff.status === "workflow_started" ? 201 : 202, {
+      ok: result.handoff.status === "workflow_started",
+      handoff: publicPublisherHandoff(result.handoff),
+      created_brief: result.createdBrief ? publicBrief(db, result.createdBrief, actor) : null,
+      terms: serviceTermsPacket(),
+      ui: ui(
+        result.handoff.status === "workflow_started" ? "Native handoff started" : "Native handoff blocked",
+        result.handoff.status === "workflow_started"
+          ? "Publisher-routed service interest is now in the real brief/proposal/order workflow; it still does not count as conversion until verified escrow or paid work."
+          : "This handoff was recorded as feedback only, not product-market fit or conversion evidence."
+      )
+    });
+  }
+
+  if (req.method === "GET" && url.pathname === "/publisher-native-handoffs") {
+    let handoffs = db.publisher_handoffs.slice();
+    const statusFilter = url.searchParams.get("status");
+    const roleFilter = url.searchParams.get("role");
+    if (statusFilter) handoffs = handoffs.filter((handoff) => handoff.status === statusFilter);
+    if (roleFilter) handoffs = handoffs.filter((handoff) => handoff.role === roleFilter);
+    writeDb(db);
+    return send(res, 200, {
+      publisher_handoffs: handoffs.slice().reverse().map(publicPublisherHandoff),
+      counts: {
+        total: handoffs.length,
+        workflow_started: handoffs.filter((handoff) => handoff.status === "workflow_started").length,
+        blocked_or_feedback_only: handoffs.filter((handoff) => handoff.status === "not_pmf").length,
+        buyer_briefs_created: handoffs.filter((handoff) => handoff.created_brief_id).length
+      },
+      filters: {
+        status: statusFilter || null,
+        role: roleFilter || null,
+        examples: ["?status=workflow_started", "?status=not_pmf", "?role=buyer", "?role=writer"]
+      },
+      ui: ui("Native publisher handoffs", "Audit ag3ntbook routed workflow starts separately from funded-order conversion evidence.")
     });
   }
 
