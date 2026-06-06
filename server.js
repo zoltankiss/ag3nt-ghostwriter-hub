@@ -235,9 +235,9 @@ function discovery() {
     capabilities: [
       { method: "GET", path: "/.well-known/add.json", summary: "Discovery document." },
       { method: "GET", path: "/", summary: "Current product map and next actions." },
-      { method: "POST", path: "/briefs", summary: "Memoir buyer: post a writing brief. Body {story,audience,tone,budget,deadline,privacy}." },
+      { method: "POST", path: "/briefs", summary: "Memoir buyer: post a writing brief. Body {story,audience,tone,budget,deadline,privacy,sample_request,requirements}." },
       { method: "GET", path: "/briefs", summary: "Browse open ghostwriting briefs." },
-      { method: "POST", path: "/samples", summary: "Writer: submit a sample for a brief. Body {brief_id,protected_preview_text,full_excerpt,price,terms,proof}." },
+      { method: "POST", path: "/samples", summary: "Writer: submit a short protected sample for a brief. Body {brief_id,protected_preview_text,full_excerpt,price,terms,proof,provenance}." },
       { method: "GET", path: "/samples", summary: "Browse writer samples." },
       { method: "POST", path: "/proposals", summary: "Writer/buyer proposal thread. Body {brief_id,sample_id,match_id,role,message,questions,terms,payee_addr,milestone_amount,visibility}." },
       { method: "GET", path: "/proposals", summary: "Browse public proposal headers and private-thread metadata." },
@@ -254,7 +254,7 @@ function discovery() {
       { method: "POST", path: "/deliveries", summary: "Writer delivery. Body {order_id,content_hash,scene_objective,interview_questions,outline_beats,draft,excerpt,rights_transfer,notes,revised_from_revision_id,supersedes_delivery_id}." },
       { method: "POST", path: "/revisions", summary: "Buyer revision request. Body {order_id,delivery_id,request,acceptance_blocker,rubric}." },
       { method: "POST", path: "/disputes", summary: "Open dispute/refund concern. Body {order_id,reason,requested_resolution}." },
-      { method: "POST", path: "/acceptances", summary: "Buyer accepts delivery and gets release command. Body {order_id,delivery_id,notes}." },
+      { method: "POST", path: "/acceptances", summary: "Buyer accepts delivery and gets release command only when quality evidence is present, or records an explicit payment-only override. Body {order_id,delivery_id,notes,acceptance_rubric,release_quality_override,override_reason}." },
       { method: "POST", path: "/refunds", summary: "Buyer requests/refunds escrow before accepted delivery. Body {order_id,reason}." },
       { method: "POST", path: "/releases", summary: "Record/reconcile escrow release after buyer runs chain release. Body {order_id,escrow_id,proof}." },
       { method: "GET", path: "/releases", summary: "Browse release records and chain release status." },
@@ -309,7 +309,7 @@ function publicActivity(db, actor = {}) {
       ad_click_to_funded_order: db.ad_attributions.filter((attribution) => attribution.status === "ready_to_attest").length
     },
     recent_feedback: db.feedback.slice(-10).reverse(),
-    recent_briefs: db.briefs.slice(-10).reverse().map((brief) => publicBrief(brief, actor)),
+    recent_briefs: db.briefs.slice(-10).reverse().map((brief) => publicBrief(db, brief, actor)),
     recent_samples: db.samples.slice(-10).reverse().map(publicSample),
     recent_proposals: db.proposals.slice(-10).reverse().map((proposal) => publicProposal(db, proposal, actor)),
     recent_profiles: db.profiles.slice(-10).reverse().map(publicProfile),
@@ -335,6 +335,23 @@ function previewText(text, max = 360) {
   return `${clean.slice(0, max).trim()}...`;
 }
 
+function wordCount(text) {
+  return String(text || "").trim().split(/\s+/).filter(Boolean).length;
+}
+
+function normalizedWritingText(text) {
+  return String(text || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function textFingerprint(text) {
+  const normalized = normalizedWritingText(text);
+  return normalized ? crypto.createHash("sha256").update(normalized).digest("hex") : null;
+}
+
 function isSameAddress(a, b) {
   return Boolean(a && b && String(a) === String(b));
 }
@@ -349,6 +366,68 @@ function actorIsWriter(order, actor) {
 
 function actorCanViewOrderPrivate(order, actor) {
   return actorIsBuyer(order, actor) || actorIsWriter(order, actor);
+}
+
+function ordersForBrief(db, briefId) {
+  if (!briefId) return [];
+  return db.orders.filter((order) => order.brief_id === briefId);
+}
+
+function briefFundingState(db, brief) {
+  const orders = ordersForBrief(db, brief?.id);
+  const funded = orders.filter((order) => Boolean(verifiedEscrowForOrder(db, order)));
+  const released = orders.filter((order) => Boolean(releasedEscrowForOrder(db, order)));
+  return {
+    state: released.length ? "paid_work_released" : funded.length ? "funded_order_exists" : "unfunded_open_brief",
+    funded_order_count: funded.length,
+    released_order_count: released.length,
+    unpaid_sample_guidance: "Public auditions should be short, non-reusable previews. Full memoir scenes belong in funded orders."
+  };
+}
+
+function briefSampleRisk(body = {}) {
+  const text = [
+    body.story,
+    body.memoir,
+    body.want,
+    body.sample_request,
+    body.payment_note,
+    body.requirements,
+    body.privacy
+  ].filter(Boolean).join(" ").toLowerCase();
+  const flags = [];
+  const requestedWords = [...text.matchAll(/(\d{3,5})\s*(?:-|to)?\s*(?:\d{3,5})?\s*(?:usable\s+|publishable\s+|polished\s+)?words?/g)]
+    .map((match) => Number(match[1]))
+    .filter((value) => Number.isFinite(value));
+  const asksLongSample = requestedWords.some((count) => count > 500) || /full audition|publishable words|usable words|before escrow/.test(text);
+  const noDeposit = /no deposit|before escrow|before i lock escrow|before funding|before payment|before i commit/.test(text);
+  if (asksLongSample && noDeposit) flags.push("unpaid_reusable_sample_request");
+  if (/rights to evaluate all sample prose|rights.*sample/.test(text) && noDeposit) flags.push("pre_payment_rights_pressure");
+  return {
+    flags,
+    requested_word_counts: requestedWords,
+    max_public_preview_words_before_escrow: 120,
+    guidance: flags.length
+      ? "This brief asks for too much reusable prose before verified escrow. Writers should answer with questions, terms, and a short non-reusable preview."
+      : "Keep pre-escrow previews short; move full scenes into funded delivery."
+  };
+}
+
+function sampleDuplicateRisk(db, actor, text, provenance) {
+  const fingerprint = textFingerprint(text);
+  if (!fingerprint) return { fingerprint: null, duplicate_of_sample_id: null, flags: [] };
+  const duplicate = db.samples.find((sample) =>
+    sample.text_fingerprint === fingerprint ||
+    (sample.excerpt && textFingerprint(sample.excerpt) === fingerprint)
+  );
+  const flags = [];
+  if (duplicate && !isSameAddress(duplicate.actor?.address, actor?.address)) flags.push("duplicate_public_sample_text");
+  if (duplicate && !provenance) flags.push("missing_provenance_for_duplicate_text");
+  return {
+    fingerprint,
+    duplicate_of_sample_id: duplicate?.id || null,
+    flags
+  };
 }
 
 function proposalParticipantAddresses(db, proposal) {
@@ -409,7 +488,7 @@ function verifiedAcceptanceForOrder(db, order, deliveryId = null) {
     acceptance.delivery_id === delivery.id &&
     acceptance.actor?.signed &&
     isSameAddress(acceptance.actor.address, order.actor?.address) &&
-    acceptance.status === "ready_to_release"
+    ["ready_to_release", "ready_to_release_quality_override"].includes(acceptance.status)
   ) || null;
 }
 
@@ -486,6 +565,24 @@ function reputationEligibleAcceptance(db, order, deliveryId = null) {
   const delivery = verifiedWriterDeliveryForOrder(db, order, acceptance.delivery_id);
   const evidence = deliveryQualityEvidence(delivery);
   return evidence.status === "memoir_quality_evidence_present" ? { acceptance, delivery, evidence } : null;
+}
+
+function acceptanceReleaseDecision(delivery, body = {}) {
+  const evidence = deliveryQualityEvidence(delivery);
+  const explicitOverride = body.release_quality_override === true || body.accept_low_quality_delivery === true;
+  const overrideReason = body.override_reason || body.quality_override_reason || null;
+  const canOfferReleaseCommand = evidence.status === "memoir_quality_evidence_present" || (explicitOverride && overrideReason);
+  return {
+    evidence,
+    explicit_override: Boolean(explicitOverride && overrideReason),
+    override_reason: overrideReason,
+    can_offer_release_command: canOfferReleaseCommand,
+    release_risk: evidence.status === "memoir_quality_evidence_present"
+      ? "memoir_quality_evidence_present"
+      : explicitOverride && overrideReason
+        ? "buyer_quality_override_not_reputation_eligible"
+        : "blocked_needs_memoir_quality_evidence_or_explicit_override"
+  };
 }
 
 function releasedEscrowForOrder(db, order) {
@@ -614,6 +711,22 @@ function reconcileOrderTrust(db) {
     ) {
       acceptance.status = "invalid_unverified_order_delivery_or_actor";
       acceptance.release_command = null;
+    } else {
+      const decision = acceptanceReleaseDecision(delivery, acceptance.raw || {});
+      acceptance.quality_evidence = decision.evidence;
+      acceptance.release_risk = decision.release_risk;
+      acceptance.quality_override = decision.explicit_override ? {
+        accepted: true,
+        reason: decision.override_reason
+      } : null;
+      if (!decision.can_offer_release_command) {
+        acceptance.status = "blocked_needs_memoir_quality_evidence";
+        acceptance.release_command = null;
+      } else if (decision.explicit_override) {
+        acceptance.status = "ready_to_release_quality_override";
+      } else {
+        acceptance.status = "ready_to_release";
+      }
     }
   }
 
@@ -676,12 +789,20 @@ function publicProfile(profile) {
   return safe;
 }
 
-function publicBrief(brief, actor) {
+function publicBrief(db, brief, actor) {
   const canViewFull = actor?.signed && isSameAddress(actor.address, brief.actor?.address);
+  const sample_risk = brief.sample_risk || briefSampleRisk(brief.raw || brief);
   return {
     ...brief,
     story: canViewFull ? brief.story : previewText(brief.story, 260),
     raw: canViewFull ? brief.raw : undefined,
+    funding_state: briefFundingState(db, brief),
+    sample_risk,
+    public_sample_policy: {
+      max_unfunded_preview_words: sample_risk.max_public_preview_words_before_escrow,
+      full_drafts_after_verified_escrow: true,
+      no_reuse_until_paid_release: true
+    },
     protected_private_details: canViewFull ? false : true
   };
 }
@@ -1063,12 +1184,13 @@ async function handle(req, res) {
   if (req.method === "GET" && url.pathname === "/briefs") {
     writeDb(db);
     return send(res, 200, {
-      briefs: db.briefs.map((brief) => publicBrief(brief, actor)),
-      ui: ui("Memoir briefs", "Writers can answer a brief with POST /samples.")
+      briefs: db.briefs.map((brief) => publicBrief(db, brief, actor)),
+      ui: ui("Memoir briefs", "Open briefs are not paid work until an order has verified escrow. Keep public samples short.")
     });
   }
 
   if (req.method === "POST" && url.pathname === "/briefs") {
+    const sampleRisk = briefSampleRisk(body);
     const item = {
       id: id("brief"),
       at: new Date().toISOString(),
@@ -1079,6 +1201,8 @@ async function handle(req, res) {
       budget: body.budget || null,
       deadline: body.deadline || null,
       privacy: body.privacy || "private_until_hired",
+      sample_risk: sampleRisk,
+      funding_state_hint: "unfunded_open_brief",
       raw: body,
       status: "open"
     };
@@ -1099,12 +1223,17 @@ async function handle(req, res) {
     writeDb(db);
     return send(res, 201, {
       ok: true,
-      brief: item,
+      brief: publicBrief(db, item, actor),
       next: [
         { method: "GET", path: "/samples", label: "Check samples" },
         { method: "POST", path: "/feedback", label: "Request missing buyer workflow" }
       ],
-      ui: ui("Brief posted", "Writers can now submit a short sample against this brief.")
+      ui: ui(
+        sampleRisk.flags.length ? "Brief posted with unpaid sample warning" : "Brief posted",
+        sampleRisk.flags.length
+          ? sampleRisk.guidance
+          : "Writers can submit a short protected preview, then move full prose into a funded order."
+      )
     });
   }
 
@@ -1129,7 +1258,18 @@ async function handle(req, res) {
       body.full_sample ||
       body.visibility === "protected"
     );
-    const publicPreview = protectedMode ? previewText(explicitPreview || body.excerpt || body.sample || fullText, 220) : fullText;
+    const linkedBrief = body.brief_id ? db.briefs.find((brief) => brief.id === body.brief_id) : null;
+    const linkedBriefFunded = linkedBrief ? ordersForBrief(db, linkedBrief.id).some((order) => verifiedEscrowForOrder(db, order)) : false;
+    const preEscrowLimit = linkedBriefFunded ? 220 : 120;
+    const publicPreview = protectedMode ? previewText(explicitPreview || body.excerpt || body.sample || fullText, preEscrowLimit * 7) : previewText(fullText, preEscrowLimit * 7);
+    const provenance = body.provenance || body.originality_proof || body.portfolio_url || body.proof || null;
+    const duplicateRisk = sampleDuplicateRisk(db, actor, publicPreview, provenance);
+    const sampleRiskFlags = [
+      ...duplicateRisk.flags,
+      ...(!linkedBriefFunded && wordCount(fullText) > 500 ? ["long_unfunded_audition_text_withheld"] : []),
+      ...(!provenance ? ["missing_sample_provenance"] : [])
+    ];
+    const blockedDuplicate = duplicateRisk.flags.includes("duplicate_public_sample_text") && duplicateRisk.flags.includes("missing_provenance_for_duplicate_text");
     const item = {
       id: id("sample"),
       at: new Date().toISOString(),
@@ -1139,39 +1279,52 @@ async function handle(req, res) {
       protected_preview: protectedMode,
       preview_source: explicitPreview ? "protected_preview_text" : protectedMode ? "generated_from_submission" : "full_public_excerpt",
       full_excerpt_stored: protectedMode ? "withheld_until_funded_order" : null,
+      text_fingerprint: duplicateRisk.fingerprint,
+      duplicate_of_sample_id: duplicateRisk.duplicate_of_sample_id,
+      provenance,
+      risk_flags: sampleRiskFlags,
+      unfunded_preview_policy: {
+        linked_brief_funded: linkedBriefFunded,
+        max_public_preview_words: preEscrowLimit,
+        full_scene_delivery_requires_verified_escrow: true
+      },
       price: body.price || null,
       terms: body.terms || null,
       proof: body.proof || null,
       raw: body,
-      status: "submitted"
+      status: blockedDuplicate ? "blocked_duplicate_or_missing_provenance" : "submitted"
     };
     db.samples.push(item);
-    db.offers.push({
-      id: id("offer"),
-      at: item.at,
-      actor,
-      can_do: `memoir sample for ${item.brief_id || "open brief"}`,
-      price: item.price,
-      proof: item.proof || item.excerpt.slice(0, 240),
-      terms: item.terms,
-      raw: body,
-      status: "open",
-      source: "sample",
-      source_id: item.id
-    });
+    if (item.status === "submitted") {
+      db.offers.push({
+        id: id("offer"),
+        at: item.at,
+        actor,
+        can_do: `memoir sample for ${item.brief_id || "open brief"}`,
+        price: item.price,
+        proof: item.proof || item.excerpt.slice(0, 240),
+        terms: item.terms,
+        raw: body,
+        status: "open",
+        source: "sample",
+        source_id: item.id
+      });
+    }
     writeDb(db);
     return send(res, 201, {
-      ok: true,
+      ok: item.status === "submitted",
       sample: item,
       next: [
         { method: "POST", path: "/proposals", label: "Open proposal" },
         { method: "POST", path: "/orders", label: "Buyer commit" }
       ],
       ui: ui(
-        "Sample submitted",
-        protectedMode
+        item.status === "submitted" ? "Sample submitted" : "Sample blocked",
+        item.status !== "submitted"
+          ? "This sample matches existing public text and needs provenance before it can create a writer offer."
+          : protectedMode
           ? "Only the preview is public. Use /proposals for questions and terms before funding."
-          : "A buyer can now commit to this writer; use protected_preview for reusable prose."
+          : "A buyer can now commit to this writer; full reusable prose belongs in funded delivery."
       )
     });
   }
@@ -1619,8 +1772,17 @@ async function handle(req, res) {
     const delivery = verifiedWriterDeliveryForOrder(db, order, body.delivery_id);
     const verifiedEscrow = verifiedEscrowForOrder(db, order);
     const escrowId = verifiedEscrow && verifiedEscrow.escrow_id;
-    const canAccept = order && delivery && escrowId && actorIsBuyer(order, actor);
-    const qualityEvidence = delivery ? deliveryQualityEvidence(delivery) : null;
+    const baseCanAccept = order && delivery && escrowId && actorIsBuyer(order, actor);
+    const releaseDecision = delivery ? acceptanceReleaseDecision(delivery, body) : null;
+    const canAccept = Boolean(baseCanAccept && releaseDecision?.can_offer_release_command);
+    const qualityEvidence = releaseDecision?.evidence || null;
+    const acceptanceStatus = !baseCanAccept
+      ? "invalid_unverified_order_delivery_escrow_or_buyer"
+      : !releaseDecision.can_offer_release_command
+        ? "blocked_needs_memoir_quality_evidence"
+        : releaseDecision.explicit_override
+          ? "ready_to_release_quality_override"
+          : "ready_to_release";
     const item = {
       id: id("accept"),
       at: new Date().toISOString(),
@@ -1630,18 +1792,30 @@ async function handle(req, res) {
       notes: body.notes || "",
       acceptance_rubric: body.acceptance_rubric || body.rubric || null,
       quality_evidence: qualityEvidence,
+      release_risk: releaseDecision?.release_risk || "invalid_unverified_order_delivery_escrow_or_buyer",
+      quality_override: releaseDecision?.explicit_override ? {
+        accepted: true,
+        reason: releaseDecision.override_reason
+      } : null,
       release_command: canAccept ? `ag3nt escrow-release ${escrowId}` : null,
       raw: body,
-      status: canAccept ? "ready_to_release" : "invalid_unverified_order_delivery_escrow_or_buyer"
+      status: acceptanceStatus
     };
     db.acceptances.push(item);
-    if (order && item.status === "ready_to_release") order.status = "accepted_pending_release";
+    if (order && ["ready_to_release", "ready_to_release_quality_override"].includes(item.status)) order.status = "accepted_pending_release";
     writeDb(db);
     return send(res, 201, {
       ok: true,
       acceptance: item,
       acceptance_checklist: acceptanceChecklist(delivery, latestRevisionAfterDelivery(db, order, delivery)),
-      ui: ui("Acceptance recorded", item.release_command ? `Release funds with: ${item.release_command}` : "Attach order, delivery, and escrow before release.")
+      ui: ui(
+        item.release_command ? "Acceptance recorded" : "Acceptance held",
+        item.release_command
+          ? item.status === "ready_to_release_quality_override"
+            ? `Quality override recorded; release is payment-only and will not create verified reputation. Release funds with: ${item.release_command}`
+            : `Release funds with: ${item.release_command}`
+          : "Release needs a verified funded order, verified writer delivery, and memoir quality evidence or an explicit buyer quality override with a reason."
+      )
     });
   }
 
