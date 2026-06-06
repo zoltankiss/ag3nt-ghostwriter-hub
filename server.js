@@ -5,7 +5,7 @@ const crypto = require("crypto");
 
 const PORT = Number(process.env.PORT || 4501);
 const CHAIN_API = process.env.AG3NT_CHAIN_API || "http://localhost:1317";
-const DATA_DIR = path.join(__dirname, "data");
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
 const DB_PATH = path.join(DATA_DIR, "db.json");
 const AGNT_ADDR = /^agnt1[0-9a-z]{38}$/;
 const BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
@@ -275,7 +275,7 @@ function discovery() {
       { method: "POST", path: "/reader-purchases", summary: "Signed chain payer buys access to a listed memoir publication. Body {publication_id,escrow_id,amount,payer_addr,payee_addr,ad_campaign_id}." },
       { method: "GET", path: "/reader-purchases", summary: "Signed readers can view their paid read-access purchases; verified status requires the signed wallet to match the chain payer." },
       { method: "GET", path: "/catalog/:id/read", summary: "Signed readers with verified payment can read the full licensed memoir material." },
-      { method: "POST", path: "/reader-reviews", summary: "Verified reader review after paid read access. Body {publication_id,reader_purchase_id,rating,message,would_buy_more}." },
+      { method: "POST", path: "/reader-reviews", summary: "Verified reader review after paid read access. Body {publication_id,reader_purchase_id,rating,message,public_blurb,would_buy_more}. Public proof uses public_blurb when provided; private message wording is hidden from non-participants." },
       { method: "GET", path: "/reader-reviews", summary: "Browse verified post-purchase reader reviews without exposing full memoir text." },
       { method: "GET", path: "/writers/:addr/reputation", summary: "Wallet-bound writer reputation from verified paid reviews, accepted deliveries, and released escrow." },
       { method: "GET", path: "/writer-dashboard", summary: "Signed writer queue split into paid work, awaiting release/review, and unfunded escrow bait." },
@@ -1004,14 +1004,16 @@ function reconcileOrderTrust(db) {
 
   for (const review of db.reader_reviews) {
     const purchase = db.reader_purchases.find((candidate) => candidate.id === review.reader_purchase_id);
-    review.leak_risk = readerReviewLeakRisk(review.message);
+    review.leak_risk = readerReviewLeakRisk(readerReviewPublicProofText(review));
     const verifiedPurchase = purchase &&
       purchase.publication_id === review.publication_id &&
       purchase.status === "verified_paid_read_access" &&
       review.actor?.signed &&
       isSameAddress(review.actor.address, purchase.actor?.address);
     review.status = verifiedPurchase
-      ? review.leak_risk.public_safe ? "verified_reader_review" : "verified_reader_review_private_quote_blocked"
+      ? review.leak_risk.public_safe && String(readerReviewPublicProofText(review)).trim()
+        ? "verified_reader_review"
+        : "verified_reader_review_private_quote_blocked"
       : "unverified_reader_review";
   }
 
@@ -1560,10 +1562,16 @@ function readerReviewLeakRisk(message) {
   const text = String(message || "");
   const lower = text.toLowerCase();
   const flags = [];
-  const quoteMatches = text.match(/["“”'‘’][^"“”'‘’]{60,}["“”'‘’]/g) || [];
+  const quoteMatches = text.match(/["“”'‘’][^"“”'‘’]{35,}["“”'‘’]/g) || [];
   const longParagraphs = text.split(/\n{2,}/).filter((part) => wordCount(part) > 80);
+  const longSentences = text.split(/[.!?]+/).filter((part) => wordCount(part) > 45);
+  const suspiciousFirstPersonMemoir = /\b(my|our)\s+(father|mother|daughter|son|spouse|wife|husband|sister|brother|grandmother|grandfather|doctor|lawyer|client|boss|company|case|diagnosis|hospital|divorce|estate|inheritance)\b/.test(lower);
+  const privateAnchorClaims = /\b(real names?|family secret|medical detail|client detail|business detail|private dialogue|exact dialogue|verbatim line|identifying detail)\b/.test(lower);
   if (quoteMatches.length) flags.push("long_quoted_passage");
   if (longParagraphs.length) flags.push("review_contains_long_passage");
+  if (longSentences.length) flags.push("review_contains_reusable_long_sentence");
+  if (suspiciousFirstPersonMemoir) flags.push("review_mentions_private_memoir_anchor");
+  if (privateAnchorClaims) flags.push("review_self_identifies_private_detail");
   if (/chapter excerpt|opening scene|full paragraph|verbatim|quoted passage|copy from the memoir|line from the draft/.test(lower)) {
     flags.push("self_identifies_reusable_memoir_text");
   }
@@ -1573,6 +1581,25 @@ function readerReviewLeakRisk(message) {
     policy: flags.length
       ? "Review recorded for the paid reader and rights holder, but public proof is blocked until it is rewritten without quoted or reusable memoir passages."
       : "Review can be public proof because it does not appear to quote reusable memoir material."
+  };
+}
+
+function readerReviewPublicProofText(review = {}) {
+  return review.public_blurb || review.raw?.public_blurb || review.raw?.public_review || review.message || "";
+}
+
+function readerReviewPrivateMessage(review = {}) {
+  return review.private_message || review.message || "";
+}
+
+function readerReviewPublicProofState(review = {}) {
+  const risk = readerReviewLeakRisk(readerReviewPublicProofText(review));
+  const hasPublicProofText = Boolean(String(readerReviewPublicProofText(review)).trim());
+  return {
+    risk,
+    has_public_proof_text: hasPublicProofText,
+    counts_as_public_reader_proof: review.status === "verified_reader_review" && risk.public_safe && hasPublicProofText,
+    public_proof_policy: "Public reader proof must be post-purchase and must not include quotes, private anchors, long passages, or reusable memoir text. Private feedback remains visible only to the reader and rights holder."
   };
 }
 
@@ -1710,6 +1737,7 @@ function publicReaderReview(db, review, actor = {}) {
     isSameAddress(actor.address, review.actor?.address) ||
     isSameAddress(actor.address, publication?.rights_holder_addr)
   );
+  const publicProof = readerReviewPublicProofState(review);
   return {
     id: review.id,
     at: review.at,
@@ -1717,20 +1745,22 @@ function publicReaderReview(db, review, actor = {}) {
     publication_id: review.publication_id,
     reader_purchase_id: review.reader_purchase_id,
     rating: review.rating,
-    message: canViewFull
-      ? review.message
+    private_message: canViewFull ? readerReviewPrivateMessage(review) : undefined,
+    public_blurb: canViewFull
+      ? (review.public_blurb || null)
       : review.status === "verified_reader_review"
-        ? previewText(review.message, 180)
+        ? previewText(readerReviewPublicProofText(review), 180)
         : review.status === "verified_reader_review_private_quote_blocked"
-          ? "Verified paid reader review recorded, but public wording is withheld because it may quote reusable memoir material."
+          ? "Verified paid reader review recorded, but public wording is withheld because it may quote reusable memoir material or private anchors."
           : "Unverified reader review wording withheld.",
+    message: canViewFull ? readerReviewPrivateMessage(review) : undefined,
     would_buy_more: review.would_buy_more,
     status: review.status,
     verified_paid_read_access: purchase?.status === "verified_paid_read_access",
-    counts_as_public_reader_proof: review.status === "verified_reader_review",
-    leak_risk: review.leak_risk || readerReviewLeakRisk(review.message),
+    counts_as_public_reader_proof: publicProof.counts_as_public_reader_proof,
+    leak_risk: review.leak_risk || publicProof.risk,
     protected_private_details: !canViewFull,
-    public_text_policy: "Reviews are post-purchase only and should not quote reusable memoir passages."
+    public_text_policy: publicProof.public_proof_policy
   };
 }
 
@@ -3045,7 +3075,8 @@ async function handle(req, res) {
       actor.signed &&
       isSameAddress(actor.address, purchase.actor?.address)
     );
-    const leakRisk = readerReviewLeakRisk(body.message || "");
+    const publicProofText = body.public_blurb || body.public_review || body.message || "";
+    const leakRisk = readerReviewLeakRisk(publicProofText);
     const item = {
       id: id("readreview"),
       at: new Date().toISOString(),
@@ -3053,12 +3084,14 @@ async function handle(req, res) {
       publication_id: body.publication_id || null,
       reader_purchase_id: body.reader_purchase_id || null,
       rating: body.rating || null,
+      private_message: body.message || "",
       message: body.message || "",
+      public_blurb: body.public_blurb || body.public_review || null,
       would_buy_more: body.would_buy_more ?? null,
       leak_risk: leakRisk,
       raw: body,
       status: verified
-        ? leakRisk.public_safe ? "verified_reader_review" : "verified_reader_review_private_quote_blocked"
+        ? leakRisk.public_safe && String(publicProofText).trim() ? "verified_reader_review" : "verified_reader_review_private_quote_blocked"
         : "unverified_reader_review"
     };
     db.reader_reviews.push(item);
