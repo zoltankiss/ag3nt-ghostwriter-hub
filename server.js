@@ -295,6 +295,7 @@ function discovery() {
       { method: "GET", path: "/ad-exchange-handoff", summary: "ag3ntads/ag3ntbook serving handoff that separates product readiness from exchange funding, campaign eligibility, and publisher context matching." },
       { method: "GET", path: "/contextual-ad-serving-status", summary: "Live contextual serving decision using Ghostwriter readiness, ag3ntads funding/eligibility, and ag3ntbook discovery context." },
       { method: "GET", path: "/publisher-handoff", summary: "Native ag3ntbook handoff packet: public-safe placement copy, routeable buyer/writer actions, terms, and PMF evidence gates." },
+      { method: "GET", path: "/customer-start", summary: "Publisher-facing native action packet for ordinary buyers/writers who do not know the Ghostwriter Hub URL." },
       { method: "POST", path: "/publisher-native-handoffs", summary: "ag3ntbook native action handoff into Ghostwriter workflow. Body {handoff_type,role,public_context_summary,tags,buyer_brief,writer_reply,terms_ack}." },
       { method: "GET", path: "/publisher-native-handoffs", summary: "Audit public-safe native publisher handoffs and blocked reader/catalog handoffs." },
       { method: "GET", path: "/publisher-ad-guidance", summary: "Contextual publisher guidance for ag3ntbook/ag3ntads: which memoir offers can be served, where, and what must stay blocked." },
@@ -310,6 +311,7 @@ function discovery() {
       { method: "POST", path: "/samples", label: "Submit sample" },
       { method: "POST", path: "/proposals", label: "Start proposal" },
       { method: "GET", path: "/publisher-handoff", label: "Publisher handoff" },
+      { method: "GET", path: "/customer-start", label: "Customer start" },
       { method: "GET", path: "/catalog", label: "Browse catalog" },
       { method: "POST", path: "/profiles", label: "Create profile" },
       { method: "POST", path: "/intents", label: "Post intent" },
@@ -1231,6 +1233,7 @@ function publicPublisherHandoff(handoff) {
     tags: handoff.tags,
     blocked_reasons: handoff.blocked_reasons,
     next_actions: handoff.next_actions,
+    feedback_payloads: handoff.feedback_payloads || [],
     proof_policy: handoff.proof_policy
   };
 }
@@ -1289,7 +1292,7 @@ function publisherNativeHandoff(db, body = {}, actor = {}) {
   const role = nativeHandoffRole(body);
   const readerRequested = role === "reader" || requestedOfferType(body) === "memoir_ebook_sales" || signals.reader_context_match;
   const unsafe = signals.unsafe_or_private_context;
-  const serviceRelevant = signals.service_context_match || /buyer|writer/.test(role);
+  const serviceRelevant = signals.service_context_match;
   const termsAck = body.terms_ack && typeof body.terms_ack === "object" ? body.terms_ack : {};
   const missingTermsAck = [
     termsAck.escrow_first ? null : "missing_escrow_first_ack",
@@ -1327,6 +1330,7 @@ function publisherNativeHandoff(db, body = {}, actor = {}) {
     decision: accepted ? "accepted_native_service_handoff" : "blocked_or_feedback_only",
     status: accepted ? "workflow_started" : "not_pmf",
     next_actions: [],
+    feedback_payloads: [],
     proof_policy: "Native handoffs are interest signals only. They do not count as conversion evidence until a signed order has verified chain escrow, accepted delivery, released paid work, or a ready ad attribution."
   };
 
@@ -1348,10 +1352,39 @@ function publisherNativeHandoff(db, body = {}, actor = {}) {
     handoff.next_actions = readerRequested
       ? [{ method: "GET", path: "/ad-readiness", label: "Reader ads remain blocked" }]
       : [{ method: "POST", path: "/feedback", label: "File blocked publisher handoff feedback" }];
+    handoff.feedback_payloads = publisherNativeHandoffFeedbackPayloads(handoff, readiness);
   }
 
   db.publisher_handoffs.push(handoff);
   return { handoff, createdBrief };
+}
+
+function publisherNativeHandoffFeedbackPayloads(handoff, readiness) {
+  const reasons = (handoff.blocked_reasons || []).join(", ");
+  return [
+    {
+      target: "ag3ntads",
+      method: "POST",
+      endpoint: `${AG3NTADS_URL}/feedback`,
+      body: {
+        sentiment: "mixed",
+        type: "native_handoff_blocked",
+        endpoint_context: "Ghostwriter Hub /publisher-native-handoffs",
+        message: `Ghostwriter Hub blocked a publisher native handoff as feedback only: ${reasons}. Do not infer conversion or PMF from this; service ads still require funded-order evidence and reader ads remain blocked until reader readiness is green.`
+      }
+    },
+    {
+      target: "ag3ntbook",
+      method: "POST",
+      endpoint: `${AG3NTBOOK_URL}/feedback`,
+      body: {
+        sentiment: "mixed",
+        type: "native_handoff_blocked",
+        endpoint_context: "Ghostwriter Hub /publisher-native-handoffs",
+        message: `Please route only public memoir-service buyer/writer actions into Ghostwriter Hub. This handoff was blocked as feedback only: ${reasons}. Reader/catalog interest is backlog, not serveable PMF, until missing gates clear: ${readiness.reader_ads.missing.join(", ")}.`
+      }
+    }
+  ];
 }
 
 function serviceTermsPacket() {
@@ -1575,6 +1608,132 @@ function publisherHandoff(db) {
   };
 }
 
+function customerStartPacket(db) {
+  const readiness = adReadiness(db);
+  const terms = serviceTermsPacket();
+  const readerBlocked = !readiness.reader_ads.ready_to_test;
+  return {
+    updated_at: new Date().toISOString(),
+    purpose: "Let ag3ntbook turn ordinary public memoir-service interest into a Ghostwriter Hub workflow without requiring the customer to know or paste the Ghostwriter Hub URL.",
+    readiness_decision: {
+      memoir_service: readiness.service_ads.ready_to_test ? "route_native_actions" : "hold_and_file_feedback",
+      reader_or_ebook: readerBlocked ? "block_and_file_feedback" : "route_only_after_separate_reader_campaign_audit",
+      pmf_rule: "Native starts are workflow starts only. Count conversion only after verified funded order, accepted delivery, released paid work, or ready ad attribution."
+    },
+    publisher_ui_actions: {
+      buyer_memoir_service: {
+        label: "Start protected memoir brief",
+        method: "POST",
+        path: "http://localhost:4501/publisher-native-handoffs",
+        body: {
+          handoff_type: "memoir_service_interest",
+          role: "buyer",
+          public_context_summary: "short public context from ag3ntbook; no names, quotes, medical, family, or business details",
+          tags: ["memoir", "family-history", "writing-help"],
+          buyer_brief: {
+            story: "thematic need only; private anchors withheld",
+            audience: "family archive, private memoir, profile, or publication goal",
+            tone: "plain-spoken, literary, restrained, funny, etc.",
+            budget: "exact amount or range",
+            deadline: "ISO date or plain deadline",
+            privacy: "private_until_hired",
+            sample_request: "short non-reusable preview only before escrow"
+          },
+          terms_ack: {
+            escrow_first: true,
+            no_unpaid_reusable_samples: true,
+            privacy_protected: true,
+            revision_terms_understood: true
+          }
+        },
+        expected_success: "Creates a public-safe /briefs record and returns private proposal/order next actions."
+      },
+      writer_reply: {
+        label: "Offer paid memoir scope",
+        method: "POST",
+        path: "http://localhost:4501/publisher-native-handoffs",
+        body: {
+          handoff_type: "memoir_service_writer_reply",
+          role: "writer",
+          public_context_summary: "public memoir-service context only",
+          tags: ["memoir", "ghostwriting", "escrow", "paid-brief"],
+          writer_reply: {
+            scope_note: "questions, diagnostic scope, payee, milestone amount, and revision terms",
+            no_full_free_sample: true
+          },
+          terms_ack: {
+            escrow_first: true,
+            no_unpaid_reusable_samples: true,
+            privacy_protected: true,
+            revision_terms_understood: true
+          }
+        },
+        expected_success: "Returns /briefs, /proposals, and /writer-dashboard actions without exposing private memoir text."
+      },
+      reader_or_catalog: {
+        label: "Do not route as reader ad",
+        method: "POST",
+        path: "http://localhost:4501/publisher-native-handoffs",
+        body: {
+          handoff_type: "reader_catalog_interest",
+          role: "reader",
+          public_context_summary: "reader/catalog request",
+          tags: ["reader", "catalog", "ebook"]
+        },
+        expected_result: readerBlocked
+          ? "Recorded as not_pmf feedback until rights-cleared catalog, exact price/license, and verified paid read access exist."
+          : "Requires separate reader readiness and campaign audit before serving."
+      }
+    },
+    terms_summary: {
+      service_offer: terms.offer,
+      privacy_terms: terms.privacy_terms,
+      sample_terms: terms.sample_terms,
+      payment_terms: terms.payment_terms,
+      revision_terms: terms.revision_terms,
+      reputation_terms: terms.reputation_terms
+    },
+    buyer_notice: {
+      headline: "Escrow-first memoir help",
+      body: "Start with a protected brief and paid diagnostic. Full reusable prose stays behind verified escrow, revisions are tied to acceptance blockers, and rights transfer only follows accepted release terms.",
+      refund_or_failure_rule: terms.payment_terms.refund_rule
+    },
+    writer_notice: {
+      headline: "No unpaid reusable sample harvesting",
+      body: "Answer with questions, scope, payee, and short protected previews. Deliver full scenes only on verified funded orders."
+    },
+    publisher_feedback_payloads: [
+      ...(readiness.service_ads.ready_to_test ? [] : [
+        {
+          target: "ag3ntads",
+          method: "POST",
+          endpoint: `${AG3NTADS_URL}/feedback`,
+          body: {
+            sentiment: "negative",
+            type: "native_customer_start_service_blocked",
+            endpoint_context: "Ghostwriter Hub /customer-start",
+            message: `Do not serve Ghostwriter Hub service placements yet: ${readiness.service_ads.missing.join(", ")}.`
+          }
+        }
+      ]),
+      ...(readerBlocked ? [
+        {
+          target: "ag3ntbook",
+          method: "POST",
+          endpoint: `${AG3NTBOOK_URL}/feedback`,
+          body: {
+            sentiment: "mixed",
+            type: "native_customer_start_reader_blocked",
+            endpoint_context: "Ghostwriter Hub /customer-start",
+            message: `Suppress Ghostwriter reader/catalog actions as ads and paid-reader PMF: ${readiness.reader_ads.missing.join(", ")}. Route only memoir service buyer/writer actions.`
+          }
+        }
+      ] : [])
+    ],
+    readiness
+  };
+}
+
 function publicActivity(db, actor = {}) {
   return {
     counts: {
@@ -1737,7 +1896,7 @@ function briefSampleRisk(body = {}) {
   const requestedWords = [...text.matchAll(/(\d{3,5})\s*(?:-|to)?\s*(?:\d{3,5})?\s*(?:usable\s+|publishable\s+|polished\s+)?words?/g)]
     .map((match) => Number(match[1]))
     .filter((value) => Number.isFinite(value));
-  const asksLongSample = requestedWords.some((count) => count > 500) || /full audition|publishable words|usable words|before escrow/.test(text);
+  const asksLongSample = requestedWords.some((count) => count > 500) || /full audition|publishable words|usable words|full draft|full scene|polished sample/.test(text);
   const noDeposit = /no deposit|before escrow|before i lock escrow|before funding|before payment|before i commit/.test(text);
   if (asksLongSample && noDeposit) flags.push("unpaid_reusable_sample_request");
   if (/rights to evaluate all sample prose|rights.*sample/.test(text) && noDeposit) flags.push("pre_payment_rights_pressure");
@@ -4874,6 +5033,14 @@ async function handle(req, res) {
     return send(res, 200, {
       ...publisherHandoff(db),
       ui: ui("Publisher handoff", "Route ordinary ag3ntbook customers into briefs, proposals, and escrow-first orders; suppress reader ads until rights-cleared paid read access exists.")
+    });
+  }
+
+  if (req.method === "GET" && url.pathname === "/customer-start") {
+    writeDb(db);
+    return send(res, 200, {
+      ...customerStartPacket(db),
+      ui: ui("Customer start", "ag3ntbook can render these native actions so ordinary buyers and writers enter the real workflow without knowing the Ghostwriter Hub URL.")
     });
   }
 
