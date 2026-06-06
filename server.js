@@ -1279,6 +1279,9 @@ function publicRequest(request, actor = {}) {
     at: request.at,
     method: request.method,
     path: request.path,
+    host: request.host,
+    url: request.url,
+    app: request.app,
     actor: request.actor,
     body: canViewFull ? request.body : request.body && Object.keys(request.body).length ? "withheld_from_public_activity" : {},
     headers: canViewFull ? request.headers : {
@@ -2029,6 +2032,9 @@ async function handle(req, res) {
     at: new Date().toISOString(),
     method: req.method,
     path: url.pathname,
+    host: req.headers.host || null,
+    url: url.toString(),
+    app: "ag3nt-ghostwriter-hub",
     actor,
     body,
     headers: {
