@@ -42,7 +42,8 @@ const initialDb = {
   order_declines: [],
   order_acknowledgements: [],
   ad_attributions: [],
-  conversions: []
+  conversions: [],
+  publisher_ad_decisions: []
 };
 
 function ensureDb() {
@@ -293,6 +294,7 @@ function discovery() {
       { method: "GET", path: "/contextual-ad-serving-status", summary: "Live contextual serving decision using Ghostwriter readiness, ag3ntads funding/eligibility, and ag3ntbook discovery context." },
       { method: "GET", path: "/publisher-ad-guidance", summary: "Contextual publisher guidance for ag3ntbook/ag3ntads: which memoir offers can be served, where, and what must stay blocked." },
       { method: "POST", path: "/publisher-ad-decision", summary: "ag3ntbook/ag3ntads can submit a public placement context and get a serve/hold decision. Body {offer_type,placement_key,context_type,tags,public_context_summary}." },
+      { method: "GET", path: "/publisher-ad-decisions", summary: "Audit public-safe contextual placement decisions. Filters: ?decision=request_ag3ntads_opportunity|do_not_request&offer_type=..." },
       { method: "GET", path: "/ad-attributions", summary: "Verified funded-order ad conversions ready for advertiser-signed ag3ntads attestation." },
       { method: "GET", path: "/activity", summary: "Recent signed usage, feedback, orders, and product learning signals." },
       { method: "POST", path: "/feedback", summary: "Report praise, complaint, bug, or feature request. Body {sentiment,type,endpoint_context,message}." }
@@ -391,6 +393,7 @@ function adReadiness(db) {
 
 function adFeedbackSignals(db) {
   const recent = db.feedback.slice(-40);
+  const recentPublisherDecisions = db.publisher_ad_decisions.slice(-40);
   const textFor = (feedback) => [
     feedback.type,
     feedback.endpoint_context,
@@ -405,6 +408,10 @@ function adFeedbackSignals(db) {
     service_demand_feedback: serviceDemand.length,
     reader_rights_or_access_blocker_feedback: readerBlockers.length,
     contextual_publisher_feedback: publisherFeedback.length,
+    recent_publisher_decision_window: recentPublisherDecisions.length,
+    publisher_contexts_allowed: recentPublisherDecisions.filter((decision) => decision.service_decision === "request_ag3ntads_opportunity").length,
+    publisher_contexts_blocked: recentPublisherDecisions.filter((decision) => decision.service_decision === "do_not_request").length,
+    publisher_reader_contexts_suppressed: recentPublisherDecisions.filter((decision) => decision.publisher_context_signals?.reader_context_match).length,
     signal_policy: "Serve only from product outcomes and recent customer feedback; do not use unsigned curiosity, blocked catalog probes, or unverified reader claims as PMF.",
     recent_public_safe_examples: recent.slice(-8).reverse().map((feedback) => ({
       id: feedback.id,
@@ -413,6 +420,15 @@ function adFeedbackSignals(db) {
       type: feedback.type,
       endpoint_context: feedback.endpoint_context,
       signed: Boolean(feedback.actor?.signed)
+    })),
+    recent_publisher_decision_examples: recentPublisherDecisions.slice(-8).reverse().map((decision) => ({
+      id: decision.id,
+      at: decision.at,
+      requested_offer_type: decision.requested_offer_type,
+      service_decision: decision.service_decision,
+      current_paid_serving: decision.current_paid_serving,
+      hold_reasons: decision.hold_reasons,
+      publisher_context_signals: decision.publisher_context_signals
     }))
   };
 }
@@ -616,6 +632,10 @@ function adCampaignPlan(db) {
       service_demand_feedback: feedbackSignals.service_demand_feedback,
       reader_rights_or_access_blocker_feedback: feedbackSignals.reader_rights_or_access_blocker_feedback,
       contextual_publisher_feedback: feedbackSignals.contextual_publisher_feedback,
+      recent_publisher_decision_window: feedbackSignals.recent_publisher_decision_window,
+      publisher_contexts_allowed: feedbackSignals.publisher_contexts_allowed,
+      publisher_contexts_blocked: feedbackSignals.publisher_contexts_blocked,
+      publisher_reader_contexts_suppressed: feedbackSignals.publisher_reader_contexts_suppressed,
       signal_policy: feedbackSignals.signal_policy
     },
     launchable_tests: serviceReady ? [
@@ -1205,6 +1225,7 @@ function publicActivity(db, actor = {}) {
       order_declines: db.order_declines.length,
       order_acknowledgements: db.order_acknowledgements.length,
       ad_attributions: db.ad_attributions.length,
+      publisher_ad_decisions: db.publisher_ad_decisions.length,
       signed_orders: db.orders.filter((o) => o.actor.signed).length,
       funded_orders: db.orders.filter((order) => orderTrustState(db, order).verified_escrow).length
     },
@@ -1230,7 +1251,10 @@ function publicActivity(db, actor = {}) {
         ...db.reader_earnings.map((earning) => earning.status === "earned_from_verified_reader_purchase" ? Number(earning.platform_fee || 0) : 0)
       ].reduce((sum, value) => sum + value, 0),
       ad_click_to_funded_order: db.ad_attributions.filter((attribution) => attribution.status === "ready_to_attest").length,
-      ad_click_to_funded_read: db.ad_attributions.filter((attribution) => attribution.status === "ready_to_attest_reader_purchase").length
+      ad_click_to_funded_read: db.ad_attributions.filter((attribution) => attribution.status === "ready_to_attest_reader_purchase").length,
+      publisher_contexts_allowed: db.publisher_ad_decisions.filter((decision) => decision.service_decision === "request_ag3ntads_opportunity").length,
+      publisher_contexts_blocked: db.publisher_ad_decisions.filter((decision) => decision.service_decision === "do_not_request").length,
+      publisher_reader_contexts_suppressed: db.publisher_ad_decisions.filter((decision) => decision.publisher_context_signals?.reader_context_match).length
     },
     recent_feedback: db.feedback.slice(-10).reverse().map((feedback) => publicFeedback(feedback, actor)),
     recent_briefs: db.briefs.slice(-10).reverse().map((brief) => publicBrief(db, brief, actor)),
@@ -1255,6 +1279,7 @@ function publicActivity(db, actor = {}) {
     recent_reader_earnings: db.reader_earnings.slice(-10).reverse().map((earning) => publicReaderEarning(db, earning, actor)),
     recent_order_acknowledgements: db.order_acknowledgements.slice(-10).reverse().map((ack) => publicOrderArtifact(db, ack, actor)),
     recent_ad_attributions: db.ad_attributions.slice(-10).reverse().map((attribution) => publicAdAttribution(db, attribution, actor)),
+    recent_publisher_ad_decisions: db.publisher_ad_decisions.slice(-10).reverse().map(publicPublisherAdDecision),
     recent_requests: db.requests.slice(-20).reverse().map((request) => publicRequest(request, actor))
   };
 }
@@ -2157,6 +2182,26 @@ function publicFeedback(feedback, actor = {}) {
     message: canViewFull ? feedback.message : "Feedback wording withheld from public activity because it may include private memoir, security, or payment details.",
     raw: canViewFull ? raw : undefined,
     protected_private_details: !canViewFull
+  };
+}
+
+function publicPublisherAdDecision(decision) {
+  return {
+    id: decision.id,
+    at: decision.at,
+    actor: decision.actor,
+    requested_offer_type: decision.requested_offer_type,
+    service_decision: decision.service_decision,
+    reader_decision: decision.reader_decision,
+    current_paid_serving: decision.current_paid_serving,
+    hold_reasons: decision.hold_reasons || [],
+    publisher_context_signals: decision.publisher_context_signals,
+    placement_key: decision.placement_key || null,
+    context_type: decision.context_type || null,
+    public_context_summary: decision.public_context_summary || "",
+    readiness_snapshot: decision.readiness_snapshot,
+    protected_private_details: true,
+    raw: undefined
   };
 }
 
@@ -4416,9 +4461,33 @@ async function handle(req, res) {
 
   if (req.method === "POST" && url.pathname === "/publisher-ad-decision") {
     const status = await contextualAdServingStatus(db);
+    const decision = publisherAdDecision(db, body, status);
+    const decisionRecord = {
+      id: id("pubaddec"),
+      at: new Date().toISOString(),
+      actor,
+      requested_offer_type: decision.decision.requested_offer_type,
+      service_decision: decision.decision.memoir_ghostwriting_service,
+      reader_decision: decision.decision.memoir_ebook_sales,
+      current_paid_serving: decision.decision.current_paid_serving,
+      hold_reasons: decision.reasons.service || [],
+      publisher_context_signals: decision.publisher_context_signals,
+      placement_key: body.placement_key || body.context?.placement_key || null,
+      context_type: body.context_type || body.context?.type || null,
+      public_context_summary: decision.publisher_context_signals.public_context_summary,
+      readiness_snapshot: {
+        service_ready_to_test: decision.readiness.service_ads.ready_to_test,
+        reader_ready_to_test: decision.readiness.reader_ads.ready_to_test,
+        reader_missing: decision.readiness.reader_ads.missing
+      },
+      raw: body,
+      status: decision.decision.memoir_ghostwriting_service === "request_ag3ntads_opportunity" ? "context_allowed" : "context_blocked"
+    };
+    db.publisher_ad_decisions.push(decisionRecord);
     writeDb(db);
     return send(res, 200, {
-      ...publisherAdDecision(db, body, status),
+      ...decision,
+      recorded_decision: publicPublisherAdDecision(decisionRecord),
       live_serving_status_summary: {
         decision: status.decision,
         reasons: status.reasons
@@ -4432,6 +4501,33 @@ async function handle(req, res) {
     return send(res, 200, {
       ...publisherAdGuidance(db),
       ui: ui("Publisher ad guidance", "Serve memoir service ads only in relevant contexts; suppress reader ads until rights and paid read access are verified.")
+    });
+  }
+
+  if (req.method === "GET" && url.pathname === "/publisher-ad-decisions") {
+    let decisions = db.publisher_ad_decisions.slice();
+    const decisionFilter = url.searchParams.get("decision");
+    const offerTypeFilter = url.searchParams.get("offer_type");
+    const statusFilter = url.searchParams.get("status");
+    if (decisionFilter) decisions = decisions.filter((decision) => decision.service_decision === decisionFilter);
+    if (offerTypeFilter) decisions = decisions.filter((decision) => decision.requested_offer_type === offerTypeFilter);
+    if (statusFilter) decisions = decisions.filter((decision) => decision.status === statusFilter);
+    writeDb(db);
+    return send(res, 200, {
+      publisher_ad_decisions: decisions.slice().reverse().map(publicPublisherAdDecision),
+      summary: {
+        total: decisions.length,
+        allowed_service_contexts: decisions.filter((decision) => decision.service_decision === "request_ag3ntads_opportunity").length,
+        blocked_contexts: decisions.filter((decision) => decision.service_decision === "do_not_request").length,
+        reader_or_catalog_contexts_suppressed: decisions.filter((decision) => decision.publisher_context_signals?.reader_context_match).length,
+        unsafe_or_private_contexts_suppressed: decisions.filter((decision) => decision.publisher_context_signals?.unsafe_or_private_context).length
+      },
+      filters: {
+        decision: decisionFilter || null,
+        offer_type: offerTypeFilter || null,
+        status: statusFilter || null
+      },
+      ui: ui("Publisher ad decisions", "Use blocked and allowed public contexts as feedback; do not treat blocked reader/catalog placements as PMF.")
     });
   }
 
