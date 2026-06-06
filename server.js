@@ -1290,6 +1290,61 @@ function createBriefFromPublisherHandoff(db, body, actor, handoffId) {
   return item;
 }
 
+function createProposalFromPublisherHandoff(db, body, actor, handoffId) {
+  const writerReply = body.writer_reply && typeof body.writer_reply === "object" ? body.writer_reply : body;
+  const briefId = writerReply.brief_id || body.brief_id || body.context?.brief_id || null;
+  const linkedBrief = briefId ? db.briefs.find((brief) => brief.id === briefId) : null;
+  if (!linkedBrief) return null;
+
+  const at = new Date().toISOString();
+  const milestoneAmount = writerReply.milestone_amount || writerReply.amount || body.milestone_amount || 75;
+  const message = {
+    id: id("msg"),
+    at,
+    actor,
+    role: "writer",
+    message: writerReply.scope_note || writerReply.message || "Publisher-routed memoir service proposal.",
+    questions: writerReply.questions || writerReply.interview_questions || null,
+    terms: writerReply.terms || body.terms || "Escrow-first paid memoir diagnostic; no unpaid reusable sample harvesting.",
+    buyer_addr: linkedBrief.actor?.address || body.buyer_addr || null,
+    payee_addr: writerReply.payee_addr || body.payee_addr || actor.address || null,
+    milestone_amount: milestoneAmount,
+    acceptance_criteria: writerReply.acceptance_criteria || "Buyer checks diagnostic usefulness, memoir-specific questions, structure, and fit before release.",
+    chapter_architecture: writerReply.chapter_architecture || null,
+    rights_terms: writerReply.rights_terms || "Private memoir material remains confidential; rights transfer follows accepted released paid work only.",
+    revision_terms: writerReply.revision_terms || "One focused revision path tied to a concrete acceptance blocker before release."
+  };
+  const item = {
+    id: id("proposal"),
+    at,
+    updated_at: at,
+    actor,
+    brief_id: linkedBrief.id,
+    sample_id: writerReply.sample_id || body.sample_id || null,
+    match_id: null,
+    intent_id: null,
+    offer_id: null,
+    buyer_addr: message.buyer_addr,
+    payee_addr: message.payee_addr,
+    milestone_amount: message.milestone_amount,
+    visibility: "private_thread",
+    terms: message.terms,
+    acceptance_criteria: message.acceptance_criteria,
+    chapter_architecture: message.chapter_architecture,
+    rights_terms: message.rights_terms,
+    revision_terms: message.revision_terms,
+    messages: [message],
+    raw: {
+      ...writerReply,
+      publisher_handoff_id: handoffId,
+      source: "ag3ntbook_native_writer_handoff"
+    },
+    status: actor.signed ? "open" : "unsigned_draft"
+  };
+  db.proposals.push(item);
+  return item;
+}
+
 function publisherNativeHandoff(db, body = {}, actor = {}) {
   const readiness = adReadiness(db);
   const signals = publisherContextSignals(body);
@@ -1345,6 +1400,7 @@ function publisherNativeHandoff(db, body = {}, actor = {}) {
   };
 
   let createdBrief = null;
+  let createdProposal = null;
   if (accepted && role === "buyer") {
     createdBrief = createBriefFromPublisherHandoff(db, body, actor, handoff.id);
     handoff.created_brief_id = createdBrief.id;
@@ -1353,9 +1409,15 @@ function publisherNativeHandoff(db, body = {}, actor = {}) {
       { method: "POST", path: "/orders", label: "Fund agreed milestone after payee confirmation", body_hint: { brief_id: createdBrief.id, deliverable: "paid diagnostic or first chapter milestone" } }
     ];
   } else if (accepted && role === "writer") {
-    handoff.next_actions = [
+    createdProposal = createProposalFromPublisherHandoff(db, body, actor, handoff.id);
+    handoff.linked_proposal_id = createdProposal?.id || null;
+    handoff.next_actions = createdProposal ? [
+      { method: "GET", path: `/proposals/${createdProposal.id}`, label: "Open private proposal" },
+      { method: "POST", path: "/orders", label: "Buyer funds agreed milestone", body_hint: { proposal_id: createdProposal.id, brief_id: createdProposal.brief_id, amount: createdProposal.milestone_amount, payee_addr: createdProposal.payee_addr } },
+      { method: "GET", path: "/writer-dashboard", label: "Open signed writer queue" }
+    ] : [
       { method: "GET", path: "/briefs", label: "Find service briefs" },
-      { method: "POST", path: "/proposals", label: "Reply with questions, scope, payee, and terms" },
+      { method: "POST", path: "/proposals", label: "Reply with questions, scope, payee, and terms", body_hint: { brief_id: "required for publisher-created proposal", visibility: "private_thread" } },
       { method: "GET", path: "/writer-dashboard", label: "Open signed writer queue" }
     ];
   } else {
@@ -1366,7 +1428,7 @@ function publisherNativeHandoff(db, body = {}, actor = {}) {
   }
 
   db.publisher_handoffs.push(handoff);
-  return { handoff, createdBrief };
+  return { handoff, createdBrief, createdProposal };
 }
 
 function publisherNativeHandoffFeedbackPayloads(handoff, readiness) {
@@ -1520,6 +1582,10 @@ function serviceTermsReadinessPacket(db) {
       accepted_handoff_endpoint: "POST http://localhost:4501/publisher-native-handoffs",
       accepted_roles: ["buyer", "writer"],
       accepted_public_contexts: readiness.service_ads.publisher_contexts,
+      writer_reply_bridge: {
+        body_path: "writer_reply.brief_id",
+        behavior: "When a writer handoff includes an existing brief id, Ghostwriter creates a private proposal thread and returns created_proposal plus linked_proposal_id."
+      },
       block_when_any_true: [
         "handoff is reader/catalog/ebook oriented while reader_ads is hold",
         "public context asks for free full drafts, publishable auditions, or rights before escrow",
@@ -1579,6 +1645,14 @@ function publisherHandoff(db) {
             privacy: "private_until_hired",
             sample_request: "short non-reusable preview only before escrow"
           },
+          writer_reply: {
+            brief_id: "existing Ghostwriter brief id when routing a writer reply to a buyer brief",
+            scope_note: "questions, diagnostic scope, payee, milestone amount, and revision terms",
+            payee_addr: "writer wallet",
+            milestone_amount: terms.offer.price_guidance.standard_paid_diagnostic_agnt,
+            acceptance_criteria: "what the buyer can inspect before release",
+            no_full_free_sample: true
+          },
           terms_ack: {
             escrow_first: true,
             no_unpaid_reusable_samples: true,
@@ -1589,7 +1663,7 @@ function publisherHandoff(db) {
             exact_diagnostic_price_seen: true
           }
         },
-        returns: "A public-safe handoff record. Buyer handoffs create a /briefs record; writer handoffs return /proposals and /writer-dashboard actions; reader/catalog handoffs are blocked as feedback only."
+        returns: "A public-safe handoff record. Buyer handoffs create a /briefs record; writer handoffs create a private /proposals thread when a target brief_id is supplied, or return /proposals and /writer-dashboard actions; reader/catalog handoffs are blocked as feedback only."
       },
       buyer_start: {
         method: "POST",
@@ -1785,7 +1859,11 @@ function customerStartPacket(db) {
           public_context_summary: "public memoir-service context only",
           tags: ["memoir", "ghostwriting", "escrow", "paid-brief"],
           writer_reply: {
+            brief_id: "optional existing Ghostwriter brief id; when present, Ghostwriter creates a private proposal thread",
             scope_note: "questions, diagnostic scope, payee, milestone amount, and revision terms",
+            payee_addr: "writer wallet",
+            milestone_amount: terms.offer.price_guidance.standard_paid_diagnostic_agnt,
+            acceptance_criteria: "what the buyer can inspect before release",
             no_full_free_sample: true
           },
           terms_ack: {
@@ -1798,7 +1876,7 @@ function customerStartPacket(db) {
             exact_diagnostic_price_seen: true
           }
         },
-        expected_success: "Returns /briefs, /proposals, and /writer-dashboard actions without exposing private memoir text."
+        expected_success: "Creates a private proposal when writer_reply.brief_id matches an existing brief; otherwise returns /briefs, /proposals, and /writer-dashboard actions without exposing private memoir text."
       },
       reader_or_catalog: {
         label: "Do not route as reader ad",
@@ -5359,6 +5437,7 @@ async function handle(req, res) {
       ok: result.handoff.status === "workflow_started",
       handoff: publicPublisherHandoff(result.handoff),
       created_brief: result.createdBrief ? publicBrief(db, result.createdBrief, actor) : null,
+      created_proposal: result.createdProposal ? publicProposal(db, result.createdProposal, actor) : null,
       terms: serviceTermsPacket(),
       ui: ui(
         result.handoff.status === "workflow_started" ? "Native handoff started" : "Native handoff blocked",
