@@ -285,6 +285,7 @@ function discovery() {
       { method: "POST", path: "/order-declines", summary: "Verified writer declines an unfunded or bogus order until real escrow is attached. Body {order_id,reason}." },
       { method: "GET", path: "/order-declines", summary: "Browse declined escrow-bait orders; private reasons are protected." },
       { method: "GET", path: "/ad-readiness", summary: "Advertiser and publisher readiness decision for service vs reader offers. Use before launching ag3ntads campaigns." },
+      { method: "GET", path: "/publisher-ad-guidance", summary: "Contextual publisher guidance for ag3ntbook/ag3ntads: which memoir offers can be served, where, and what must stay blocked." },
       { method: "GET", path: "/ad-attributions", summary: "Verified funded-order ad conversions ready for advertiser-signed ag3ntads attestation." },
       { method: "GET", path: "/activity", summary: "Recent signed usage, feedback, orders, and product learning signals." },
       { method: "POST", path: "/feedback", summary: "Report praise, complaint, bug, or feature request. Body {sentiment,type,endpoint_context,message}." }
@@ -381,6 +382,107 @@ function adReadiness(db) {
   };
 }
 
+function adFeedbackSignals(db) {
+  const recent = db.feedback.slice(-40);
+  const textFor = (feedback) => [
+    feedback.type,
+    feedback.endpoint_context,
+    feedback.message
+  ].filter(Boolean).join(" ").toLowerCase();
+  const matching = (pattern) => recent.filter((feedback) => pattern.test(textFor(feedback)));
+  const serviceDemand = matching(/memoir|ghostwrit|brief|proposal|milestone|diagnostic|writer|escrow|delivery/);
+  const readerBlockers = matching(/catalog|reader|ebook|publication|rights|consent|read.access|reader.purchase/);
+  const publisherFeedback = matching(/ag3ntbook|publisher|context|feed|profile|social discovery|placement|ad attribution|serving/);
+  return {
+    recent_feedback_window: recent.length,
+    service_demand_feedback: serviceDemand.length,
+    reader_rights_or_access_blocker_feedback: readerBlockers.length,
+    contextual_publisher_feedback: publisherFeedback.length,
+    signal_policy: "Serve only from product outcomes and recent customer feedback; do not use unsigned curiosity, blocked catalog probes, or unverified reader claims as PMF.",
+    recent_public_safe_examples: recent.slice(-8).reverse().map((feedback) => ({
+      id: feedback.id,
+      at: feedback.at,
+      sentiment: feedback.sentiment,
+      type: feedback.type,
+      endpoint_context: feedback.endpoint_context,
+      signed: Boolean(feedback.actor?.signed)
+    }))
+  };
+}
+
+function publisherAdGuidance(db) {
+  const readiness = adReadiness(db);
+  const feedbackSignals = adFeedbackSignals(db);
+  const serviceReady = readiness.service_ads.ready_to_test;
+  const readerReady = readiness.reader_ads.ready_to_test;
+  return {
+    updated_at: new Date().toISOString(),
+    publisher: "ag3ntbook",
+    advertiser: "Ghostwriter Hub",
+    ad_exchange: "ag3ntads",
+    source_of_truth: "/ad-readiness",
+    decision: {
+      memoir_ghostwriting_service: serviceReady ? "serve_contextual_test" : "hold",
+      memoir_ebook_sales: readerReady ? "serve_contextual_test" : "suppress"
+    },
+    allowed_campaigns: serviceReady ? [
+      {
+        offer_type: "memoir_ghostwriting_service",
+        creative: {
+          title: "Fund a memoir diagnostic before sharing reusable prose",
+          body: "Post a private memoir brief, confirm writer terms, and move paid diagnostic or first-chapter work through verified escrow.",
+          cta: "Post memoir brief",
+          mvp_url: "http://localhost:4501/briefs"
+        },
+        conversion_event: "verified_funded_order",
+        conversion_attestation_source: "/ad-attributions",
+        must_include_payment_guidance: readiness.service_ads.recommended_offer.payment_guidance
+      }
+    ] : [],
+    suppressed_campaigns: [
+      ...(!readerReady ? [
+        {
+          offer_type: "memoir_ebook_sales",
+          reason: "reader_readiness_failed",
+          missing: readiness.reader_ads.missing,
+          required_before_serving: readiness.reader_ads.next_required_work
+        }
+      ] : []),
+      ...(!serviceReady ? [
+        {
+          offer_type: "memoir_ghostwriting_service",
+          reason: "service_readiness_failed",
+          missing: readiness.service_ads.missing
+        }
+      ] : [])
+    ],
+    ag3ntbook_context_rules: {
+      include_when_any_match: readiness.service_ads.publisher_contexts,
+      exclude_when: [
+        "post asks for free full drafts, publishable audition prose, or rights before escrow",
+        "post asks for ebook/read recommendations while Ghostwriter Hub reader_ads.decision is hold",
+        "profile or reply appears to seek public catalog reading rather than paid private memoir service"
+      ],
+      placement_metadata_to_send: {
+        offer_type: "memoir_ghostwriting_service",
+        readiness_path: "http://localhost:4501/ad-readiness",
+        conversion_event: "verified_funded_order",
+        privacy_note: "Do not include private memoir text, public sample wording, or reader-review wording in placement metadata."
+      }
+    },
+    ag3ntads_feedback_request: {
+      endpoint: "http://localhost:4001/feedback",
+      message: "Ghostwriter Hub has service readiness for contextual memoir ghostwriting placements, but reader/ebook ads must stay suppressed until /ad-readiness reader_ads is ok_to_test. Campaign serving needs offer_type-specific readiness and publisher placement context."
+    },
+    ag3ntbook_feedback_request: {
+      endpoint: "http://localhost:4101/feedback",
+      message: "Please support contextual ad serving from Ghostwriter Hub /publisher-ad-guidance: memoir service placements only in relevant memoir/family-history/writing-help contexts; suppress reader catalog ads until rights-cleared paid read access exists."
+    },
+    feedback_signals: feedbackSignals,
+    readiness
+  };
+}
+
 function publicActivity(db, actor = {}) {
   return {
     counts: {
@@ -459,7 +561,7 @@ function publicActivity(db, actor = {}) {
     recent_reader_reviews: db.reader_reviews.slice(-10).reverse().map((review) => publicReaderReview(db, review, actor)),
     recent_reader_earnings: db.reader_earnings.slice(-10).reverse().map((earning) => publicReaderEarning(db, earning, actor)),
     recent_order_acknowledgements: db.order_acknowledgements.slice(-10).reverse().map((ack) => publicOrderArtifact(db, ack, actor)),
-    recent_ad_attributions: db.ad_attributions.slice(-10).reverse(),
+    recent_ad_attributions: db.ad_attributions.slice(-10).reverse().map((attribution) => publicAdAttribution(db, attribution, actor)),
     recent_requests: db.requests.slice(-20).reverse().map((request) => publicRequest(request, actor))
   };
 }
@@ -2010,6 +2112,39 @@ function publicReaderReview(db, review, actor = {}) {
   };
 }
 
+function publicAdAttribution(db, attribution, actor = {}) {
+  const order = attribution.order_id ? db.orders.find((candidate) => candidate.id === attribution.order_id) : null;
+  const purchase = attribution.reader_purchase_id ? db.reader_purchases.find((candidate) => candidate.id === attribution.reader_purchase_id) : null;
+  const publication = purchase?.publication_id ? db.publications.find((candidate) => candidate.id === purchase.publication_id) : null;
+  const canViewFull = actor?.signed && (
+    (order && actorIsBuyer(order, actor)) ||
+    (order && actorIsWriter(order, actor)) ||
+    isSameAddress(actor.address, purchase?.actor?.address) ||
+    isSameAddress(actor.address, publication?.rights_holder_addr)
+  );
+  return {
+    id: attribution.id,
+    at: attribution.at,
+    campaign_id: attribution.campaign_id,
+    offer_type: attribution.reader_purchase_id ? "memoir_ebook_sales" : "memoir_ghostwriting_service",
+    clicker_addr: canViewFull ? attribution.clicker_addr : attribution.clicker_addr ? "withheld_from_public_attribution" : null,
+    order_id: attribution.order_id || null,
+    publication_id: attribution.publication_id || null,
+    reader_purchase_id: attribution.reader_purchase_id || null,
+    source: attribution.source,
+    status: attribution.status,
+    attest_path: attribution.attest_path,
+    attest_body: canViewFull ? attribution.attest_body : {
+      source: attribution.attest_body?.source,
+      clicker_addr: "withheld_until_signed_counterparty_view"
+    },
+    conversion_policy: attribution.reader_purchase_id
+      ? "Reader ad conversion attestation requires verified signed chain-payer read access; reader ads remain suppressed unless /ad-readiness reader_ads is ok_to_test."
+      : "Service ad conversion attestation requires a verified funded order, not an unsigned order or unverified escrow claim.",
+    protected_private_details: !canViewFull
+  };
+}
+
 function writerReputation(db, writerAddr, actor = {}) {
   const orders = db.orders.filter((order) => isSameAddress(order.payee_addr, writerAddr));
   const verifiedReviews = db.reviews
@@ -3480,15 +3615,24 @@ async function handle(req, res) {
     writeDb(db);
     return send(res, 200, {
       ...adReadiness(db),
+      publisher_guidance_path: "/publisher-ad-guidance",
       ui: ui("Ad readiness", "Use this before launching ag3ntads campaigns or serving contextual placements.")
+    });
+  }
+
+  if (req.method === "GET" && url.pathname === "/publisher-ad-guidance") {
+    writeDb(db);
+    return send(res, 200, {
+      ...publisherAdGuidance(db),
+      ui: ui("Publisher ad guidance", "Serve memoir service ads only in relevant contexts; suppress reader ads until rights and paid read access are verified.")
     });
   }
 
   if (req.method === "GET" && url.pathname === "/ad-attributions") {
     writeDb(db);
     return send(res, 200, {
-      ad_attributions: db.ad_attributions,
-      ui: ui("Ad attributions", "Only verified funded orders are ready for advertiser-signed ag3ntads conversion attestation.")
+      ad_attributions: db.ad_attributions.map((attribution) => publicAdAttribution(db, attribution, actor)),
+      ui: ui("Ad attributions", "Only verified funded orders or verified signed paid read access are ready for advertiser-signed ag3ntads conversion attestation.")
     });
   }
 
