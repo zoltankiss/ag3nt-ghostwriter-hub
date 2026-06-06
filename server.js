@@ -1297,8 +1297,11 @@ function publisherNativeHandoff(db, body = {}, actor = {}) {
   const missingTermsAck = [
     termsAck.escrow_first ? null : "missing_escrow_first_ack",
     termsAck.no_unpaid_reusable_samples ? null : "missing_no_unpaid_reusable_samples_ack",
+    termsAck.sample_boundary_understood ? null : "missing_sample_boundary_ack",
     termsAck.privacy_protected ? null : "missing_privacy_protected_ack",
-    termsAck.revision_terms_understood ? null : "missing_revision_terms_ack"
+    termsAck.revision_terms_understood ? null : "missing_revision_terms_ack",
+    termsAck.refund_rule_understood ? null : "missing_refund_rule_ack",
+    termsAck.exact_diagnostic_price_seen ? null : "missing_exact_diagnostic_price_ack"
   ].filter(Boolean);
   const blockedReasons = [
     ...(readiness.service_ads.ready_to_test ? [] : readiness.service_ads.missing),
@@ -1321,8 +1324,11 @@ function publisherNativeHandoff(db, body = {}, actor = {}) {
     terms_ack: {
       escrow_first: Boolean(termsAck.escrow_first),
       no_unpaid_reusable_samples: Boolean(termsAck.no_unpaid_reusable_samples),
+      sample_boundary_understood: Boolean(termsAck.sample_boundary_understood),
       privacy_protected: Boolean(termsAck.privacy_protected),
-      revision_terms_understood: Boolean(termsAck.revision_terms_understood)
+      revision_terms_understood: Boolean(termsAck.revision_terms_understood),
+      refund_rule_understood: Boolean(termsAck.refund_rule_understood),
+      exact_diagnostic_price_seen: Boolean(termsAck.exact_diagnostic_price_seen)
     },
     blocked_reasons: blockedReasons,
     created_brief_id: null,
@@ -1392,9 +1398,12 @@ function serviceTermsPacket() {
     offer: {
       name: "Paid memoir diagnostic or first chapter milestone",
       price_guidance: {
-        diagnostic: "Buyer and writer set an exact signed milestone amount in /proposals or /orders.",
+        standard_paid_diagnostic_agnt: 75,
+        diagnostic: "The standard paid diagnostic is exactly 75 AGNT unless buyer and writer sign a different amount in /proposals before /orders.",
+        first_chapter_milestone_agnt: "custom_signed_amount_required_before_order",
         platform_fee_rate_default: 0.15,
-        writer_net_visible_on_orders: true
+        writer_net_visible_on_orders: true,
+        no_surprise_fees: "The order response shows gross amount, platform fee, and writer net before release."
       },
       deliverables: [
         "private interview questions",
@@ -1426,6 +1435,7 @@ function serviceTermsPacket() {
       funded_signal: "Only signed orders with verified numeric chain escrow count as funded conversion evidence.",
       release_signal: "Writer earnings and verified reputation require accepted delivery plus released escrow.",
       refund_rule: "Before accepted delivery, the buyer can request refund guidance. After acceptance, use dispute/release records rather than silent clawback.",
+      failure_rule: "If the writer misses the funded milestone deadline or submits non-substantive work, the buyer should request a focused revision, open a dispute, or request refund guidance before release.",
       release_command_policy: "Release commands are shown only after verified order, verified writer delivery, and memoir quality evidence, unless the buyer records an explicit payment-only quality override."
     },
     revision_terms: {
@@ -1480,8 +1490,11 @@ function publisherHandoff(db) {
           terms_ack: {
             escrow_first: true,
             no_unpaid_reusable_samples: true,
+            sample_boundary_understood: true,
             privacy_protected: true,
-            revision_terms_understood: true
+            revision_terms_understood: true,
+            refund_rule_understood: true,
+            exact_diagnostic_price_seen: true
           }
         },
         returns: "A public-safe handoff record. Buyer handoffs create a /briefs record; writer handoffs return /proposals and /writer-dashboard actions; reader/catalog handoffs are blocked as feedback only."
@@ -1542,6 +1555,7 @@ function publisherHandoff(db) {
       },
       customer_notices: {
         service_terms: "Tell buyers this is escrow-first paid memoir work with protected interviews, focused revisions, and no unpaid reusable sample harvesting.",
+        price_terms: "Show the exact standard paid diagnostic price: 75 AGNT. Custom first-chapter milestones require a signed proposal amount before order funding.",
         reader_terms: readerBlocked
           ? "Do not present Ghostwriter Hub as an ebook/catalog destination yet."
           : "Reader placements require the listed publication's exact price, license/access terms, refund/failure rule, and verified paid read path."
@@ -1642,8 +1656,11 @@ function customerStartPacket(db) {
           terms_ack: {
             escrow_first: true,
             no_unpaid_reusable_samples: true,
+            sample_boundary_understood: true,
             privacy_protected: true,
-            revision_terms_understood: true
+            revision_terms_understood: true,
+            refund_rule_understood: true,
+            exact_diagnostic_price_seen: true
           }
         },
         expected_success: "Creates a public-safe /briefs record and returns private proposal/order next actions."
@@ -1664,8 +1681,11 @@ function customerStartPacket(db) {
           terms_ack: {
             escrow_first: true,
             no_unpaid_reusable_samples: true,
+            sample_boundary_understood: true,
             privacy_protected: true,
-            revision_terms_understood: true
+            revision_terms_understood: true,
+            refund_rule_understood: true,
+            exact_diagnostic_price_seen: true
           }
         },
         expected_success: "Returns /briefs, /proposals, and /writer-dashboard actions without exposing private memoir text."
@@ -1695,7 +1715,7 @@ function customerStartPacket(db) {
     },
     buyer_notice: {
       headline: "Escrow-first memoir help",
-      body: "Start with a protected brief and paid diagnostic. Full reusable prose stays behind verified escrow, revisions are tied to acceptance blockers, and rights transfer only follows accepted release terms.",
+      body: "Start with a protected brief and the 75 AGNT standard paid diagnostic, or sign a custom milestone amount before funding. Full reusable prose stays behind verified escrow, revisions are tied to acceptance blockers, and rights transfer only follows accepted release terms.",
       refund_or_failure_rule: terms.payment_terms.refund_rule
     },
     writer_notice: {
