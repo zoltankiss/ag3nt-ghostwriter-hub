@@ -269,7 +269,7 @@ function discovery() {
       { method: "POST", path: "/reviews", summary: "Review a delivered sample/order. Body {order_id,rating,message,would_pay_again}." },
       { method: "GET", path: "/reviews", summary: "Browse paid/released reputation without private memoir details. Filters: ?status=verified_paid_review&writer_addr=...&buyer_addr=..." },
       { method: "POST", path: "/publications", summary: "Rights holder requests reader listing for released memoir material. Body {order_id,delivery_id,title,public_preview,price,buyer_consent,rights_scope,reader_license_terms}." },
-      { method: "POST", path: "/publication-consents", summary: "Signed writer grants or denies reader-sale consent for an order/delivery/publication. Body {order_id,delivery_id,publication_id,reader_sales_consent,rights_scope,reader_license_terms,max_reader_price}." },
+      { method: "POST", path: "/publication-consents", summary: "Signed writer grants, limits, or revokes reader-sale consent for an order/delivery/publication. Body {order_id,delivery_id,publication_id,reader_sales_consent,rights_scope,reader_license_terms,max_reader_price}." },
       { method: "GET", path: "/publication-consents", summary: "Browse public-safe writer publication consent state. Filters: ?publication_id=...&order_id=...&writer_addr=..." },
       { method: "GET", path: "/catalog", summary: "Browse rights-cleared memoir previews. Public previews are short and non-reusable." },
       { method: "POST", path: "/reader-purchases", summary: "Signed chain payer buys access to a listed memoir publication. Body {publication_id,escrow_id,amount,payer_addr,payee_addr,ad_campaign_id}." },
@@ -922,9 +922,16 @@ function reconcileOrderTrust(db) {
 
   for (const consent of db.publication_consents) {
     const decision = publicationConsentDecision(db, consent.raw || consent, consent.actor);
+    const isDenial = consent.reader_sales_consent !== true;
+    const signedWriterCanControlPublication = Boolean(decision.order && decision.delivery && actorIsWriter(decision.order, consent.actor));
     consent.verification_failures = decision.failures;
     consent.max_reader_price = decision.max_reader_price;
-    consent.status = decision.ok ? "verified_writer_publication_consent" : "blocked_writer_publication_consent";
+    if (isDenial && signedWriterCanControlPublication) {
+      consent.verification_failures = ["writer_publication_consent_denied_or_revoked"];
+      consent.status = "writer_publication_consent_denied_or_revoked";
+    } else {
+      consent.status = decision.ok ? "verified_writer_publication_consent" : "blocked_writer_publication_consent";
+    }
   }
 
   for (const publication of db.publications) {
@@ -938,7 +945,14 @@ function reconcileOrderTrust(db) {
       delivery?.rights_transfer,
       order?.raw?.rights_terms
     ].filter(Boolean).join(" ").toLowerCase();
+    const latestWriterConsent = latestWriterPublicationConsentEvent(db, publication);
     const writerConsent = verifiedWriterPublicationConsent(db, publication);
+    const writerConsentRevoked = Boolean(latestWriterConsent && latestWriterConsent.reader_sales_consent !== true);
+    const writerConsentPriceLimited = Boolean(
+      latestWriterConsent?.reader_sales_consent &&
+      latestWriterConsent.max_reader_price &&
+      Number(publication.price || 0) > Number(latestWriterConsent.max_reader_price)
+    );
     const failures = [
       ...(!order ? ["missing_order"] : []),
       ...(!delivery ? ["missing_verified_writer_delivery"] : []),
@@ -946,13 +960,27 @@ function reconcileOrderTrust(db) {
       ...(!released ? ["missing_released_escrow"] : []),
       ...(qualityEvidence?.status === "memoir_quality_evidence_present" ? [] : ["missing_memoir_quality_evidence"]),
       ...(!publication.buyer_consent ? ["missing_buyer_rights_holder_consent"] : []),
-      ...(writerConsent ? [] : ["missing_signed_writer_publication_consent"]),
+      ...(writerConsent ? [] : [
+        writerConsentRevoked
+          ? "writer_publication_consent_denied_or_revoked"
+          : writerConsentPriceLimited
+            ? "publication_price_above_writer_consent_limit"
+            : "missing_signed_writer_publication_consent"
+      ]),
       ...(rightsTextAllowsReaderSales(rightsText) ? [] : ["rights_scope_does_not_allow_reader_sales"]),
       ...(Number(publication.price) > 0 ? [] : ["missing_positive_reader_price"]),
       ...(Number(publication.preview_word_count || 0) <= 120 ? [] : ["public_preview_too_long"])
     ];
+    publication.latest_writer_consent_id = latestWriterConsent?.id || null;
     publication.verified_writer_consent_id = writerConsent?.id || null;
     publication.writer_consent = Boolean(writerConsent);
+    publication.writer_consent_state = writerConsent
+      ? "verified_writer_publication_consent"
+      : writerConsentRevoked
+        ? "writer_publication_consent_denied_or_revoked"
+        : writerConsentPriceLimited
+          ? "publication_price_above_writer_consent_limit"
+          : "missing_signed_writer_publication_consent";
     publication.rights_verification_failures = failures;
     publication.rights_verified_after_release = Boolean(released);
     publication.status = failures.length ? "blocked_rights_or_release_missing" : "listed";
@@ -1435,19 +1463,29 @@ function verifiedWriterPublicationConsent(db, publication) {
   if (!publication) return null;
   const order = db.orders.find((candidate) => candidate.id === publication.order_id);
   if (!order) return null;
+  const latestConsent = latestWriterPublicationConsentEvent(db, publication);
+  if (!latestConsent || !latestConsent.reader_sales_consent) return null;
+  if (latestConsent.max_reader_price && Number(publication.price || 0) > Number(latestConsent.max_reader_price)) return null;
+  const rightsText = [
+    latestConsent.rights_scope,
+    latestConsent.reader_license_terms,
+    latestConsent.consent_terms,
+    publication.rights_scope,
+    publication.reader_license_terms
+  ].filter(Boolean).join(" ").toLowerCase();
+  return latestConsent.status === "verified_writer_publication_consent" && rightsTextAllowsReaderSales(rightsText)
+    ? latestConsent
+    : null;
+}
+
+function latestWriterPublicationConsentEvent(db, publication) {
+  if (!publication) return null;
+  const order = db.orders.find((candidate) => candidate.id === publication.order_id);
+  if (!order) return null;
   return db.publication_consents.slice().reverse().find((consent) => {
-    if (!consent.reader_sales_consent || !actorIsWriter(order, consent.actor)) return false;
+    if (!actorIsWriter(order, consent.actor)) return false;
     if (consent.publication_id && consent.publication_id !== publication.id) return false;
-    if (consent.order_id !== publication.order_id || consent.delivery_id !== publication.delivery_id) return false;
-    if (consent.max_reader_price && Number(publication.price || 0) > Number(consent.max_reader_price)) return false;
-    const rightsText = [
-      consent.rights_scope,
-      consent.reader_license_terms,
-      consent.consent_terms,
-      publication.rights_scope,
-      publication.reader_license_terms
-    ].filter(Boolean).join(" ").toLowerCase();
-    return consent.status === "verified_writer_publication_consent" && rightsTextAllowsReaderSales(rightsText);
+    return consent.order_id === publication.order_id && consent.delivery_id === publication.delivery_id;
   }) || null;
 }
 
@@ -1457,14 +1495,22 @@ function publicationRightsDecision(db, body, actor) {
   const released = releasedEscrowForOrder(db, order);
   const qualityEvidence = delivery ? deliveryQualityEvidence(delivery) : null;
   const price = Number(body.price || body.reader_price || 0);
-  const writerConsent = verifiedWriterPublicationConsent(db, {
+  const publicationShape = {
     id: body.publication_id || null,
     order_id: body.order_id,
     delivery_id: body.delivery_id,
     price,
     rights_scope: body.rights_scope || null,
     reader_license_terms: body.reader_license_terms || null
-  });
+  };
+  const latestWriterConsent = latestWriterPublicationConsentEvent(db, publicationShape);
+  const writerConsent = verifiedWriterPublicationConsent(db, publicationShape);
+  const writerConsentRevoked = Boolean(latestWriterConsent && latestWriterConsent.reader_sales_consent !== true);
+  const writerConsentPriceLimited = Boolean(
+    latestWriterConsent?.reader_sales_consent &&
+    latestWriterConsent.max_reader_price &&
+    price > Number(latestWriterConsent.max_reader_price)
+  );
   const rightsText = [
     body.rights_scope,
     body.reader_license_terms,
@@ -1481,7 +1527,13 @@ function publicationRightsDecision(db, body, actor) {
     ...(!released ? ["missing_released_escrow"] : []),
     ...(qualityEvidence?.status === "memoir_quality_evidence_present" ? [] : ["missing_memoir_quality_evidence"]),
     ...(body.buyer_consent === true || body.rights_holder_consent === true ? [] : ["missing_buyer_rights_holder_consent"]),
-    ...(writerConsent ? [] : ["missing_signed_writer_publication_consent"]),
+    ...(writerConsent ? [] : [
+      writerConsentRevoked
+        ? "writer_publication_consent_denied_or_revoked"
+        : writerConsentPriceLimited
+          ? "publication_price_above_writer_consent_limit"
+          : "missing_signed_writer_publication_consent"
+    ]),
     ...(rightsTextAllowsReaderSales(rightsText) ? [] : ["rights_scope_does_not_allow_reader_sales"]),
     ...(Number.isFinite(price) && price > 0 ? [] : ["missing_positive_reader_price"]),
     ...(previewWords <= 120 ? [] : ["public_preview_too_long"])
@@ -1493,6 +1545,7 @@ function publicationRightsDecision(db, body, actor) {
     delivery,
     released,
     writer_consent: writerConsent,
+    latest_writer_consent: latestWriterConsent,
     quality_evidence: qualityEvidence,
     price,
     preview_words: previewWords
@@ -1550,7 +1603,9 @@ function publicPublication(db, publication, actor = {}) {
     consent: {
       buyer_consent: publication.buyer_consent,
       writer_consent: publication.writer_consent,
+      writer_consent_state: publication.writer_consent_state || (publication.writer_consent ? "verified_writer_publication_consent" : "missing_signed_writer_publication_consent"),
       verified_writer_consent_id: publication.verified_writer_consent_id || null,
+      latest_writer_consent_id: publication.latest_writer_consent_id || null,
       rights_verified_after_release: Boolean(released)
     },
     craft_evidence: delivery ? {
@@ -1586,7 +1641,7 @@ function publicPublicationConsent(db, consent, actor = {}) {
     consent_terms: canViewFull ? consent.consent_terms : consent.consent_terms ? previewText(consent.consent_terms, 160) : null,
     status: consent.status,
     verification_failures: consent.verification_failures || [],
-    public_policy: "Reader-sale listings require this signed writer consent plus buyer/rightsholder consent, released escrow, memoir-quality evidence, explicit reader-sale rights, and paid read access.",
+    public_policy: "Reader-sale listings require active signed writer consent plus buyer/rightsholder consent, released escrow, memoir-quality evidence, explicit reader-sale rights, and paid read access. A later signed writer denial blocks future catalog listing.",
     protected_private_details: !canViewFull
   };
 }
@@ -2757,6 +2812,11 @@ async function handle(req, res) {
 
   if (req.method === "POST" && url.pathname === "/publication-consents") {
     const decision = publicationConsentDecision(db, body, actor);
+    const readerSalesConsent = body.reader_sales_consent === true || body.writer_consent === true;
+    const signedWriterCanControlPublication = Boolean(decision.order && decision.delivery && actorIsWriter(decision.order, actor));
+    const consentStatus = readerSalesConsent
+      ? decision.ok ? "verified_writer_publication_consent" : "blocked_writer_publication_consent"
+      : signedWriterCanControlPublication ? "writer_publication_consent_denied_or_revoked" : "blocked_writer_publication_consent";
     const item = {
       id: id("pubconsent"),
       at: new Date().toISOString(),
@@ -2764,14 +2824,14 @@ async function handle(req, res) {
       publication_id: body.publication_id || null,
       order_id: body.order_id || decision.publication?.order_id || null,
       delivery_id: body.delivery_id || decision.publication?.delivery_id || null,
-      reader_sales_consent: body.reader_sales_consent === true || body.writer_consent === true,
+      reader_sales_consent: readerSalesConsent,
       max_reader_price: decision.max_reader_price,
       rights_scope: body.rights_scope || decision.publication?.rights_scope || null,
       reader_license_terms: body.reader_license_terms || decision.publication?.reader_license_terms || "personal_read_access_only_no_reuse_no_training_no_redistribution",
       consent_terms: body.consent_terms || body.writer_consent_evidence || null,
-      verification_failures: decision.failures,
+      verification_failures: consentStatus === "writer_publication_consent_denied_or_revoked" ? ["writer_publication_consent_denied_or_revoked"] : decision.failures,
       raw: body,
-      status: decision.ok ? "verified_writer_publication_consent" : "blocked_writer_publication_consent"
+      status: consentStatus
     };
     db.publication_consents.push(item);
     reconcileOrderTrust(db);
@@ -2781,9 +2841,15 @@ async function handle(req, res) {
       publication_consent: publicPublicationConsent(db, item, actor),
       publication: decision.publication ? publicPublication(db, decision.publication, actor) : null,
       ui: ui(
-        item.status === "verified_writer_publication_consent" ? "Writer consent verified" : "Writer consent blocked",
+        item.status === "verified_writer_publication_consent"
+          ? "Writer consent verified"
+          : item.status === "writer_publication_consent_denied_or_revoked"
+            ? "Writer consent revoked"
+            : "Writer consent blocked",
         item.status === "verified_writer_publication_consent"
           ? "This signed writer consent can satisfy the catalog rights gate for the matching publication/order delivery."
+          : item.status === "writer_publication_consent_denied_or_revoked"
+            ? "Future reader-sale listing for the matching publication/order delivery is blocked until the signed writer grants consent again."
           : "Only the signed order writer can consent to reader sales, and the consent must explicitly allow reader access or publication."
       )
     });
