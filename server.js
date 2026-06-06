@@ -1223,6 +1223,36 @@ function nativeHandoffRole(body = {}) {
   return "buyer";
 }
 
+function publisherBuyerBriefSignal(body = {}) {
+  const briefBody = body.buyer_brief && typeof body.buyer_brief === "object" ? body.buyer_brief : {};
+  const summary = previewText(
+    body.public_context_summary ||
+    body.context?.public_context_summary ||
+    body.summary ||
+    briefBody.public_summary ||
+    "",
+    220
+  );
+  const story = previewText(briefBody.story || briefBody.memoir || briefBody.want || body.story || body.memoir || body.want || "", 220);
+  const combined = [summary, story].filter(Boolean).join(" ");
+  const enoughContext = wordCount(combined) >= 6;
+  const hasPlaceholder = /^(short public|thematic need|publisher-routed|memoir service interest|required|optional|n\/a|none)$/i.test(combined.trim());
+  return {
+    ok: enoughContext && !hasPlaceholder,
+    public_context_summary: summary || null,
+    buyer_story_signal: story || null,
+    requirements: [
+      "public_context_summary or buyer_brief.story must be a short non-identifying memoir-service summary",
+      "do not include names, quotes, medical, family, business, or other private memoir anchors",
+      "generic clicks, empty buyer_brief objects, and placeholder copy are feedback only"
+    ],
+    missing: [
+      enoughContext ? null : "missing_public_safe_buyer_brief_summary",
+      hasPlaceholder ? "placeholder_buyer_brief_summary" : null
+    ].filter(Boolean)
+  };
+}
+
 function publicPublisherHandoff(handoff) {
   return {
     id: handoff.id,
@@ -1236,6 +1266,7 @@ function publicPublisherHandoff(handoff) {
     diagnostic_checkout: handoff.diagnostic_checkout || null,
     public_context_summary: handoff.public_context_summary,
     tags: handoff.tags,
+    publisher_signal_requirements: handoff.publisher_signal_requirements || null,
     blocked_reasons: handoff.blocked_reasons,
     next_actions: handoff.next_actions,
     feedback_payloads: handoff.feedback_payloads || [],
@@ -1384,8 +1415,9 @@ function publisherNativeHandoff(db, body = {}, actor = {}) {
   const readerRequested = role === "reader" || requestedOfferType(body) === "memoir_ebook_sales" || signals.reader_context_match;
   const unsafe = signals.unsafe_or_private_context;
   const serviceRelevant = signals.service_context_match;
+  const buyerBriefSignal = role === "buyer" ? publisherBuyerBriefSignal(body) : null;
   const termsAck = body.terms_ack && typeof body.terms_ack === "object" ? body.terms_ack : {};
-  const missingTermsAck = [
+  const missingTermsAck = role === "reader" ? [] : [
     termsAck.escrow_first ? null : "missing_escrow_first_ack",
     termsAck.no_unpaid_reusable_samples ? null : "missing_no_unpaid_reusable_samples_ack",
     termsAck.sample_boundary_understood ? null : "missing_sample_boundary_ack",
@@ -1399,6 +1431,7 @@ function publisherNativeHandoff(db, body = {}, actor = {}) {
     ...(readerRequested ? ["reader_or_catalog_handoff_blocked_until_reader_ads_ready"] : []),
     ...(unsafe ? signals.blocker_hits.map((hit) => `blocked_${hit}`) : []),
     ...(serviceRelevant ? [] : ["handoff_context_not_memoir_service_relevant"]),
+    ...(buyerBriefSignal?.ok === false ? buyerBriefSignal.missing : []),
     ...missingTermsAck
   ];
   const accepted = blockedReasons.length === 0 && role !== "reader";
@@ -1412,6 +1445,10 @@ function publisherNativeHandoff(db, body = {}, actor = {}) {
     public_context_summary: signals.public_context_summary || previewText(body.public_context_summary || "", 180),
     tags: signals.tags,
     signals,
+    publisher_signal_requirements: {
+      buyer_brief: buyerBriefSignal,
+      policy: "Buyer handoffs need a real public-safe memoir-service summary before Ghostwriter creates a brief. Missing or placeholder publisher context is feedback only, not a workflow start or PMF."
+    },
     terms_ack: {
       escrow_first: Boolean(termsAck.escrow_first),
       no_unpaid_reusable_samples: Boolean(termsAck.no_unpaid_reusable_samples),
@@ -1621,6 +1658,17 @@ function serviceTermsReadinessPacket(db) {
       accepted_handoff_endpoint: "POST http://localhost:4501/publisher-native-handoffs",
       accepted_roles: ["buyer", "writer"],
       accepted_public_contexts: readiness.service_ads.publisher_contexts,
+      buyer_brief_signal_required: {
+        body_paths: ["public_context_summary", "buyer_brief.story", "buyer_brief.want", "buyer_brief.memoir"],
+        minimum_signal: "At least six words of public-safe, non-identifying memoir-service context.",
+        blocked_when: [
+          "the handoff is only a generic click or role",
+          "buyer_brief is empty",
+          "the summary is placeholder copy",
+          "the summary includes private names, quotes, medical, family, business, sample, delivery, or review text"
+        ],
+        feedback_policy: "Missing buyer brief signal is filed as publisher-serving feedback and does not create /briefs or PMF."
+      },
       writer_reply_bridge: {
         body_path: "writer_reply.brief_id",
         behavior: "When a writer handoff includes an existing brief id, Ghostwriter creates a private proposal thread and returns created_proposal plus linked_proposal_id."
@@ -1632,6 +1680,7 @@ function serviceTermsReadinessPacket(db) {
       },
       block_when_any_true: [
         "handoff is reader/catalog/ebook oriented while reader_ads is hold",
+        "buyer handoff has no real public-safe memoir brief summary",
         "public context asks for free full drafts, publishable auditions, or rights before escrow",
         "public context contains private memoir text, names, quotes, family/business/medical anchors, sample wording, delivery excerpts, or review wording",
         "any required terms_ack flag is missing or false"
@@ -1678,10 +1727,10 @@ function publisherHandoff(db) {
         body_hint: {
           handoff_type: "memoir_service_interest",
           role: "buyer or writer",
-          public_context_summary: "short public ag3ntbook context only",
+          public_context_summary: "required short public ag3ntbook memoir-service context only; no placeholders",
           tags: ["memoir", "family-history", "writing-help"],
           buyer_brief: {
-            story: "thematic public summary; private anchors withheld",
+            story: "required thematic public summary with private anchors withheld",
             audience: "family archive or publication goal",
             tone: "plain-spoken, literary, funny, restrained, etc.",
             budget: "exact amount or range",
@@ -1771,6 +1820,7 @@ function publisherHandoff(db) {
       },
       customer_notices: {
         service_terms: "Tell buyers this is escrow-first paid memoir work with protected interviews, focused revisions, and no unpaid reusable sample harvesting.",
+        buyer_brief_signal: "Do not send generic clicks as buyer starts. ag3ntbook must include a short public-safe memoir-service summary or Ghostwriter will record the handoff as feedback only.",
         price_terms: "Show the exact standard paid diagnostic price: 75 AGNT. Custom first-chapter milestones require a signed proposal amount before order funding.",
         reader_terms: readerBlocked
           ? "Do not present Ghostwriter Hub as an ebook/catalog destination yet."
@@ -1871,10 +1921,10 @@ function customerStartPacket(db) {
         body: {
           handoff_type: "memoir_service_interest",
           role: "buyer",
-          public_context_summary: "short public context from ag3ntbook; no names, quotes, medical, family, or business details",
+          public_context_summary: "required short public memoir-service context from ag3ntbook; no names, quotes, medical, family, or business details",
           tags: ["memoir", "family-history", "writing-help"],
           buyer_brief: {
-            story: "thematic need only; private anchors withheld",
+            story: "required thematic need only; private anchors withheld",
             audience: "family archive, private memoir, profile, or publication goal",
             tone: "plain-spoken, literary, restrained, funny, etc.",
             budget: "exact amount or range",
@@ -1892,7 +1942,7 @@ function customerStartPacket(db) {
             exact_diagnostic_price_seen: true
           }
         },
-        expected_success: "Creates a public-safe /briefs record and returns private proposal/order next actions plus diagnostic_checkout with exact 75 AGNT amount, payee requirement, and escrow ref rule."
+        expected_success: "Creates a public-safe /briefs record only when public-safe buyer context is present, then returns private proposal/order next actions plus diagnostic_checkout with exact 75 AGNT amount, payee requirement, and escrow ref rule."
       },
       writer_reply: {
         label: "Offer paid memoir scope",
@@ -2030,7 +2080,7 @@ function proposalBridgePacket(db, actor = {}, filters = {}) {
         step: "native_public_handoff",
         endpoint: "POST http://localhost:4501/publisher-native-handoffs",
         counts_as_conversion: false,
-        required: ["public memoir-service context", "buyer or writer role", "all service terms acknowledgements"],
+        required: ["public memoir-service context", "buyer or writer role", "buyer handoffs include a real public-safe brief summary", "all service terms acknowledgements"],
         result: "Buyer handoffs create a protected /briefs record and diagnostic checkout draft; writer handoffs can create a private proposal plus checkout draft when a target brief_id is supplied."
       },
       {
