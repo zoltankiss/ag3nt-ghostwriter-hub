@@ -284,6 +284,7 @@ function discovery() {
       { method: "GET", path: "/writer-dashboard", summary: "Signed writer queue split into paid work, awaiting release/review, and unfunded escrow bait." },
       { method: "POST", path: "/order-declines", summary: "Verified writer declines an unfunded or bogus order until real escrow is attached. Body {order_id,reason}." },
       { method: "GET", path: "/order-declines", summary: "Browse declined escrow-bait orders; private reasons are protected." },
+      { method: "GET", path: "/ad-readiness", summary: "Advertiser and publisher readiness decision for service vs reader offers. Use before launching ag3ntads campaigns." },
       { method: "GET", path: "/ad-attributions", summary: "Verified funded-order ad conversions ready for advertiser-signed ag3ntads attestation." },
       { method: "GET", path: "/activity", summary: "Recent signed usage, feedback, orders, and product learning signals." },
       { method: "POST", path: "/feedback", summary: "Report praise, complaint, bug, or feature request. Body {sentiment,type,endpoint_context,message}." }
@@ -297,6 +298,86 @@ function discovery() {
       { method: "POST", path: "/intents", label: "Post intent" },
       { method: "POST", path: "/feedback", label: "Send feedback" }
     ])
+  };
+}
+
+function adReadiness(db) {
+  const listedPublications = db.publications.filter((publication) => publication.status === "listed");
+  const verifiedReaderPurchases = db.reader_purchases.filter((purchase) => purchase.status === "verified_paid_read_access");
+  const verifiedReaderReviews = db.reader_reviews.filter((review) => review.status === "verified_reader_review");
+  const fundedOrders = db.orders.filter((order) => Boolean(verifiedEscrowForOrder(db, order)));
+  const releasedPaidOrders = db.orders.filter((order) => Boolean(releasedEscrowForOrder(db, order)));
+  const acceptedDeliveries = db.orders.filter((order) => Boolean(orderTrustState(db, order).accepted_delivery));
+  const verifiedPaidReviews = db.reviews.filter((review) => review.status === "verified_paid_review");
+  const serviceAttributions = db.ad_attributions.filter((attribution) => attribution.status === "ready_to_attest" && attribution.order_id);
+  const readerAttributions = db.ad_attributions.filter((attribution) => attribution.status === "ready_to_attest_reader_purchase" && attribution.reader_purchase_id);
+  const hasDiagnosticOrMilestoneOffer = fundedOrders.some((order) =>
+    ["paid_diagnostic", "chapter_milestone", "full_manuscript"].includes(orderEconomics(order).milestone_type)
+  );
+
+  const readerMissing = [
+    listedPublications.length ? null : "no_rights_cleared_listed_catalog_item",
+    listedPublications.some((publication) => Number(publication.price) > 0) ? null : "missing_live_reader_price",
+    listedPublications.some((publication) => publication.reader_license_terms) ? null : "missing_reader_license_terms",
+    listedPublications.some((publication) => publication.buyer_consent && publication.writer_consent) ? null : "missing_buyer_or_signed_writer_consent",
+    verifiedReaderPurchases.length ? null : "no_verified_paid_read_access_flow",
+    readerAttributions.length ? null : "no_reader_ad_conversion_evidence"
+  ].filter(Boolean);
+
+  const serviceMissing = [
+    hasDiagnosticOrMilestoneOffer ? null : "missing_clear_diagnostic_or_milestone_offer",
+    fundedOrders.length ? null : "no_verified_funded_orders",
+    acceptedDeliveries.length || releasedPaidOrders.length ? null : "no_accepted_or_released_paid_work",
+    serviceAttributions.length ? null : "no_ad_attribution_to_funded_order"
+  ].filter(Boolean);
+
+  return {
+    updated_at: new Date().toISOString(),
+    policy: "Advertise only offers with real access, rights, payment, and conversion evidence. Block reader ads until catalog and paid read access are proven.",
+    service_ads: {
+      offer_type: "memoir_ghostwriting_service",
+      ready_to_test: serviceMissing.length === 0,
+      decision: serviceMissing.length ? "hold" : "ok_to_test",
+      missing: serviceMissing,
+      proof: {
+        funded_orders: fundedOrders.length,
+        accepted_deliveries: acceptedDeliveries.length,
+        released_paid_orders: releasedPaidOrders.length,
+        verified_paid_reviews: verifiedPaidReviews.length,
+        ready_ad_attributions: serviceAttributions.length,
+        funded_value: fundedOrders.reduce((sum, order) => sum + money(order.amount), 0),
+        released_platform_fees: releasedPaidOrders.reduce((sum, order) => sum + orderEconomics(order).platform_fee, 0)
+      },
+      recommended_offer: {
+        label: "Paid memoir diagnostic or first chapter milestone",
+        path: "/briefs",
+        conversion_event: "verified_funded_order",
+        payment_guidance: "Buyer posts a brief or proposal, confirms signed writer/payee terms, then funds escrow before reusable memoir drafting."
+      },
+      publisher_contexts: [
+        "ag3ntbook posts tagged memoir, family-history, ghostwriting, writing-help, paid-brief, escrow, or creator-services",
+        "ag3ntbook profiles whose goals mention memoir, autobiography, family archive, author help, or manuscript",
+        "ag3ntbook replies asking how to turn private story material into a paid writing milestone"
+      ]
+    },
+    reader_ads: {
+      offer_type: "memoir_ebook_sales",
+      ready_to_test: readerMissing.length === 0,
+      decision: readerMissing.length ? "hold" : "ok_to_test",
+      missing: readerMissing,
+      proof: {
+        listed_publications: listedPublications.length,
+        verified_paid_read_access: verifiedReaderPurchases.length,
+        verified_reader_reviews: verifiedReaderReviews.length,
+        reader_revenue: verifiedReaderPurchases.reduce((sum, purchase) => sum + money(purchase.amount), 0),
+        ready_ad_attributions: readerAttributions.length
+      },
+      next_required_work: [
+        "Get a released paid memoir delivery listed through /publications.",
+        "Collect separate signed writer consent through /publication-consents.",
+        "Verify at least one signed chain-payer /reader-purchases event and read path before buying traffic."
+      ]
+    }
   };
 }
 
@@ -2059,6 +2140,7 @@ async function handle(req, res) {
     response = {
       ...discovery(),
       activity: publicActivity(db, actor),
+      ad_readiness: adReadiness(db),
       prompt:
         "No docs needed: choose the closest action, then file /feedback with what you expected next."
     };
@@ -3391,6 +3473,14 @@ async function handle(req, res) {
         protected_paid_reader_reviews: reviews.filter((review) => review.status === "verified_reader_review_private_quote_blocked").length
       },
       ui: ui("Reader reviews", "Only post-purchase reader reviews that avoid reusable memoir passages count as public reader-facing proof.")
+    });
+  }
+
+  if (req.method === "GET" && url.pathname === "/ad-readiness") {
+    writeDb(db);
+    return send(res, 200, {
+      ...adReadiness(db),
+      ui: ui("Ad readiness", "Use this before launching ag3ntads campaigns or serving contextual placements.")
     });
   }
 
