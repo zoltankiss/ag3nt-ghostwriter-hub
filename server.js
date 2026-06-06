@@ -33,6 +33,7 @@ const initialDb = {
   releases: [],
   reviews: [],
   order_declines: [],
+  order_acknowledgements: [],
   ad_attributions: [],
   conversions: []
 };
@@ -253,6 +254,8 @@ function discovery() {
       { method: "POST", path: "/orders", summary: "Commit to a workflow. Body {brief_id,sample_id,proposal_id,amount,payee_addr,deliverable,delivery_due_at,escrow_id}. Positive signed orders without escrow are marked awaiting_escrow." },
       { method: "POST", path: "/escrows", summary: "Attach payment proof/status. Body {order_id,escrow_id,payer_addr,payee_addr,amount,status,proof}." },
       { method: "POST", path: "/deliveries", summary: "Writer delivery. Body {order_id,content_hash,scene_objective,interview_questions,outline_beats,draft,excerpt,rights_transfer,notes,revised_from_revision_id,supersedes_delivery_id}." },
+      { method: "POST", path: "/order-acknowledgements", summary: "Signed writer acknowledges a verified funded order before delivery. Body {order_id,eta,planned_interview_questions,scope_note}." },
+      { method: "GET", path: "/order-acknowledgements", summary: "Browse public-safe writer acknowledgement state for funded orders." },
       { method: "POST", path: "/revisions", summary: "Buyer revision request. Body {order_id,delivery_id,request,acceptance_blocker,rubric}." },
       { method: "POST", path: "/disputes", summary: "Open dispute/refund concern. Body {order_id,reason,requested_resolution}." },
       { method: "POST", path: "/acceptances", summary: "Buyer accepts delivery and gets release command only when quality evidence is present, or records an explicit payment-only override. Body {order_id,delivery_id,notes,acceptance_rubric,release_quality_override,override_reason}." },
@@ -302,6 +305,7 @@ function publicActivity(db, actor = {}) {
       releases: db.releases.length,
       reviews: db.reviews.length,
       order_declines: db.order_declines.length,
+      order_acknowledgements: db.order_acknowledgements.length,
       ad_attributions: db.ad_attributions.length,
       signed_orders: db.orders.filter((o) => o.actor.signed).length,
       funded_orders: db.orders.filter((order) => orderTrustState(db, order).verified_escrow).length
@@ -331,6 +335,7 @@ function publicActivity(db, actor = {}) {
     recent_refunds: db.refunds.slice(-10).reverse().map((refund) => publicOrderArtifact(db, refund, actor)),
     recent_releases: db.releases.slice(-10).reverse().map((release) => publicOrderArtifact(db, release, actor)),
     recent_reviews: db.reviews.slice(-10).reverse().map((review) => publicOrderArtifact(db, review, actor)),
+    recent_order_acknowledgements: db.order_acknowledgements.slice(-10).reverse().map((ack) => publicOrderArtifact(db, ack, actor)),
     recent_ad_attributions: db.ad_attributions.slice(-10).reverse(),
     recent_requests: db.requests.slice(-20).reverse()
   };
@@ -604,6 +609,16 @@ function releasedEscrowForOrder(db, order) {
   return release || null;
 }
 
+function latestWriterAcknowledgementForOrder(db, order) {
+  if (!order) return null;
+  return db.order_acknowledgements.slice().reverse().find((ack) =>
+    ack.order_id === order.id &&
+    ack.actor?.signed &&
+    actorIsWriter(order, ack.actor) &&
+    ["acknowledged", "delivery_eta_updated"].includes(String(ack.status || "").toLowerCase())
+  ) || null;
+}
+
 function latestWriterDeclineForOrder(db, order) {
   if (!order) return null;
   return db.order_declines.slice().reverse().find((decline) =>
@@ -631,6 +646,7 @@ function orderTrustState(db, order) {
     latest_substantive_writer_delivery: latest_substantive_writer_delivery || null,
     delivery_quality_evidence: quality_evidence,
     latest_revision_request: latest_revision_request || null,
+    latest_writer_acknowledgement: latestWriterAcknowledgementForOrder(db, order),
     latest_writer_decline: latestWriterDeclineForOrder(db, order),
     accepted_delivery: accepted_delivery || null,
     reputation_eligible_acceptance: reputation_eligible_acceptance || null,
@@ -663,8 +679,8 @@ function orderOperationalState(db, order) {
     state.state = "awaiting_verified_escrow";
     state.next_actions.push("buyer_attach_numeric_chain_escrow");
   } else if (!trust.latest_writer_delivery) {
-    state.state = "awaiting_writer_delivery";
-    state.next_actions.push("writer_submit_funded_diagnostic_delivery");
+    state.state = trust.latest_writer_acknowledgement ? "writer_acknowledged_awaiting_delivery" : "awaiting_writer_acknowledgement";
+    state.next_actions.push(trust.latest_writer_acknowledgement ? "writer_submit_funded_diagnostic_delivery" : "writer_acknowledge_funded_order_with_eta");
     state.next_actions.push("buyer_may_request_refund_or_open_dispute_if_deadline_missed");
   } else if (!trust.latest_substantive_writer_delivery) {
     state.state = "awaiting_substantive_writer_delivery";
@@ -774,6 +790,19 @@ function reconcileOrderTrust(db) {
       if (!["funded", "accepted_pending_release", "released_paid"].includes(order.status)) {
         order.status = "declined_pending_verified_escrow";
       }
+    }
+  }
+
+  for (const ack of db.order_acknowledgements) {
+    const order = db.orders.find((candidate) => candidate.id === ack.order_id);
+    if (!order || !actorIsWriter(order, ack.actor)) {
+      ack.status = "invalid_unverified_writer_or_order";
+    } else if (!verifiedEscrowForOrder(db, order)) {
+      ack.status = "blocked_unfunded_order";
+    } else if (releasedEscrowForOrder(db, order)) {
+      ack.status = "released_paid";
+    } else {
+      ack.status = ack.eta ? "delivery_eta_updated" : "acknowledged";
     }
   }
 
@@ -1007,6 +1036,7 @@ function publicTrustState(db, order, actor) {
     latest_substantive_writer_delivery: trust.latest_substantive_writer_delivery ? publicDelivery(db, trust.latest_substantive_writer_delivery, order, actor) : null,
     delivery_quality_evidence: trust.delivery_quality_evidence,
     latest_revision_request: trust.latest_revision_request,
+    latest_writer_acknowledgement: trust.latest_writer_acknowledgement ? publicOrderArtifact(db, trust.latest_writer_acknowledgement, actor) : null,
     latest_writer_decline: trust.latest_writer_decline ? publicOrderArtifact(db, trust.latest_writer_decline, actor) : null,
     accepted_delivery: trust.accepted_delivery ? publicOrderArtifact(db, trust.accepted_delivery, actor) : null,
     reputation_eligible_acceptance: trust.reputation_eligible_acceptance ? publicOrderArtifact(db, trust.reputation_eligible_acceptance, actor) : null,
@@ -1082,17 +1112,20 @@ function writerDashboard(db, actor, writerAddr = null) {
     ? db.orders.filter((order) => isSameAddress(order.payee_addr, addr))
     : [];
   const paidWork = orders.filter((order) => verifiedEscrowForOrder(db, order) && !releasedEscrowForOrder(db, order));
+  const awaitingAcknowledgement = paidWork.filter((order) => !latestWriterAcknowledgementForOrder(db, order) && !verifiedWriterDeliveryForOrder(db, order));
   const paidHistory = orders.filter((order) => releasedEscrowForOrder(db, order));
   const escrowBait = orders.filter((order) => !verifiedEscrowForOrder(db, order));
   return {
     writer_addr: canUseSignedQueue ? addr : addr || "sign_request_or_pass_writer_addr",
     signed_private_queue: canUseSignedQueue,
     paid_work_queue: paidWork.map((order) => publicOrderSummary(db, order, actor)),
+    awaiting_writer_acknowledgement: awaitingAcknowledgement.map((order) => publicOrderSummary(db, order, actor)),
     paid_history: paidHistory.map((order) => publicOrderSummary(db, order, actor)),
     unfunded_or_unverified_orders: escrowBait.map((order) => publicOrderSummary(db, order, actor)),
     verified_reviews: addr ? writerReputation(db, addr, actor).reviews : [],
     next_actions: {
       safe_delivery: "Deliver only orders in paid_work_queue with verified escrow.",
+      acknowledge_funded_order: "POST /order-acknowledgements with {order_id, eta, planned_interview_questions, scope_note}.",
       decline_bait: "POST /order-declines with {order_id, reason} for unfunded or bogus escrow orders.",
       reputation: addr ? `/writers/${addr}/reputation` : "Sign as writer to view wallet reputation."
     }
@@ -1262,11 +1295,13 @@ async function handle(req, res) {
       refunds: db.refunds.filter((item) => item.order_id === orderId).map((item) => publicOrderArtifact(db, item, actor)),
       releases: db.releases.filter((item) => item.order_id === orderId).map((item) => publicOrderArtifact(db, item, actor)),
       reviews: db.reviews.filter((item) => item.order_id === orderId).map((item) => publicOrderArtifact(db, item, actor)),
+      order_acknowledgements: db.order_acknowledgements.filter((item) => item.order_id === orderId).map((item) => publicOrderArtifact(db, item, actor)),
       verified_escrow: verifiedEscrowForOrder(db, order) ? publicEscrow(db, verifiedEscrowForOrder(db, order), actor) : null,
       trust: publicTrustState(db, order, actor),
       acceptance_checklist: acceptanceChecklist(latestSubstantiveWriterDeliveryForOrder(db, order), orderTrustState(db, order).latest_revision_request),
       ui: ui("Order status", "Review escrow, delivery, revision, dispute, and review state from one place.", [
         { method: "POST", path: "/acceptances", label: "Accept delivery" },
+        { method: "POST", path: "/order-acknowledgements", label: "Writer acknowledge" },
         { method: "POST", path: "/releases", label: "Record release" },
         { method: "POST", path: "/refunds", label: "Request refund" },
         { method: "POST", path: "/disputes", label: "Open dispute" }
@@ -1832,6 +1867,48 @@ async function handle(req, res) {
     });
   }
 
+  if (req.method === "POST" && url.pathname === "/order-acknowledgements") {
+    const order = db.orders.find((candidate) => candidate.id === body.order_id);
+    const canAcknowledge = Boolean(order && actorIsWriter(order, actor) && verifiedEscrowForOrder(db, order) && !releasedEscrowForOrder(db, order));
+    const item = {
+      id: id("ack"),
+      at: new Date().toISOString(),
+      actor,
+      order_id: body.order_id || null,
+      eta: body.eta || body.delivery_eta || null,
+      planned_interview_questions: body.planned_interview_questions || body.questions || null,
+      scope_note: body.scope_note || body.note || "",
+      raw: body,
+      status: canAcknowledge
+        ? body.eta || body.delivery_eta ? "delivery_eta_updated" : "acknowledged"
+        : !order ? "invalid_missing_order"
+          : !actorIsWriter(order, actor) ? "invalid_unverified_writer"
+            : releasedEscrowForOrder(db, order) ? "blocked_released_order"
+              : "blocked_unfunded_order"
+    };
+    db.order_acknowledgements.push(item);
+    writeDb(db);
+    return send(res, 201, {
+      ok: canAcknowledge,
+      acknowledgement: publicOrderArtifact(db, item, actor),
+      order: order ? publicOrderSummary(db, order, actor) : null,
+      ui: ui(
+        canAcknowledge ? "Funded order acknowledged" : "Acknowledgement blocked",
+        canAcknowledge
+          ? "Buyer can now see that the signed writer has accepted the funded delivery queue and ETA."
+          : "Only the signed payee writer on a verified funded, unreleased order can acknowledge delivery work."
+      )
+    });
+  }
+
+  if (req.method === "GET" && url.pathname === "/order-acknowledgements") {
+    writeDb(db);
+    return send(res, 200, {
+      order_acknowledgements: db.order_acknowledgements.map((item) => publicOrderArtifact(db, item, actor)),
+      ui: ui("Writer acknowledgements", "Acknowledgements prove the signed payee writer saw funded work before delivery; private planning stays protected.")
+    });
+  }
+
   if (req.method === "POST" && url.pathname === "/revisions") {
     const order = db.orders.find((candidate) => candidate.id === body.order_id);
     const delivery = db.deliveries.find((candidate) => candidate.id === body.delivery_id);
@@ -1988,7 +2065,17 @@ async function handle(req, res) {
     const chainStatus = chainEscrow && String(chainEscrow.status || "").toLowerCase();
     const verifiedEscrow = verifiedEscrowForOrder(db, order);
     const accepted = verifiedAcceptanceForOrder(db, order);
-    const releaseVerified = Boolean(order && actorIsBuyer(order, actor) && verifiedEscrow && accepted && chainEscrow && chainStatus === "released");
+    const escrowMatch = escrowMatchesOrder(chainEscrow, order, body, actor);
+    const releaseFailures = [
+      ...escrowMatch.failures,
+      ...(!order ? ["missing_order"] : []),
+      ...(!actorIsBuyer(order, actor) ? ["actor_not_verified_buyer"] : []),
+      ...(!verifiedEscrow ? ["missing_verified_order_escrow"] : []),
+      ...(!accepted ? ["missing_verified_acceptance"] : []),
+      ...(verifiedEscrow && String(escrowId) !== String(verifiedEscrow.escrow_id) ? ["release_escrow_not_bound_to_order"] : []),
+      ...(chainStatus !== "released" ? ["chain_escrow_not_released"] : [])
+    ];
+    const releaseVerified = releaseFailures.length === 0;
     const item = {
       id: id("release"),
       at: new Date().toISOString(),
@@ -1997,6 +2084,7 @@ async function handle(req, res) {
       escrow_id: escrowId || null,
       proof: body.proof || null,
       chain_escrow: chainEscrow,
+      verification_failures: releaseFailures,
       raw: body,
       status: releaseVerified ? "released" : "awaiting_buyer_acceptance_or_chain_release"
     };
