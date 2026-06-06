@@ -27,6 +27,8 @@ const initialDb = {
   deliveries: [],
   revisions: [],
   disputes: [],
+  acceptances: [],
+  refunds: [],
   reviews: [],
   conversions: []
 };
@@ -227,6 +229,8 @@ function discovery() {
       { method: "POST", path: "/deliveries", summary: "Writer delivery. Body {order_id,content_hash,excerpt,rights_transfer,notes}." },
       { method: "POST", path: "/revisions", summary: "Buyer revision request. Body {order_id,request,acceptance_blocker}." },
       { method: "POST", path: "/disputes", summary: "Open dispute/refund concern. Body {order_id,reason,requested_resolution}." },
+      { method: "POST", path: "/acceptances", summary: "Buyer accepts delivery and gets release command. Body {order_id,delivery_id,notes}." },
+      { method: "POST", path: "/refunds", summary: "Buyer requests/refunds escrow before accepted delivery. Body {order_id,reason}." },
       { method: "POST", path: "/reviews", summary: "Review a delivered sample/order. Body {order_id,rating,message,would_pay_again}." },
       { method: "GET", path: "/activity", summary: "Recent signed usage, feedback, orders, and product learning signals." },
       { method: "POST", path: "/feedback", summary: "Report praise, complaint, bug, or feature request. Body {sentiment,type,endpoint_context,message}." }
@@ -257,6 +261,8 @@ function publicActivity(db) {
       deliveries: db.deliveries.length,
       revisions: db.revisions.length,
       disputes: db.disputes.length,
+      acceptances: db.acceptances.length,
+      refunds: db.refunds.length,
       reviews: db.reviews.length,
       signed_orders: db.orders.filter((o) => o.actor.signed).length,
       funded_orders: db.orders.filter((o) => o.status === "funded").length
@@ -272,6 +278,8 @@ function publicActivity(db) {
     recent_deliveries: db.deliveries.slice(-10).reverse(),
     recent_revisions: db.revisions.slice(-10).reverse(),
     recent_disputes: db.disputes.slice(-10).reverse(),
+    recent_acceptances: db.acceptances.slice(-10).reverse(),
+    recent_refunds: db.refunds.slice(-10).reverse(),
     recent_reviews: db.reviews.slice(-10).reverse(),
     recent_requests: db.requests.slice(-20).reverse()
   };
@@ -378,8 +386,14 @@ async function handle(req, res) {
       deliveries: db.deliveries.filter((item) => item.order_id === orderId),
       revisions: db.revisions.filter((item) => item.order_id === orderId),
       disputes: db.disputes.filter((item) => item.order_id === orderId),
+      acceptances: db.acceptances.filter((item) => item.order_id === orderId),
+      refunds: db.refunds.filter((item) => item.order_id === orderId),
       reviews: db.reviews.filter((item) => item.order_id === orderId),
-      ui: ui("Order status", "Review escrow, delivery, revision, dispute, and review state from one place.")
+      ui: ui("Order status", "Review escrow, delivery, revision, dispute, and review state from one place.", [
+        { method: "POST", path: "/acceptances", label: "Accept delivery" },
+        { method: "POST", path: "/refunds", label: "Request refund" },
+        { method: "POST", path: "/disputes", label: "Open dispute" }
+      ])
     });
   }
 
@@ -779,9 +793,68 @@ async function handle(req, res) {
     return send(res, 200, { disputes: db.disputes, ui: ui("Disputes", "Open refund or quality concerns.") });
   }
 
+  if (req.method === "POST" && url.pathname === "/acceptances") {
+    const order = db.orders.find((candidate) => candidate.id === body.order_id);
+    const delivery = db.deliveries.find((candidate) => candidate.id === body.delivery_id);
+    const escrowId = order && order.escrow_id;
+    const item = {
+      id: id("accept"),
+      at: new Date().toISOString(),
+      actor,
+      order_id: body.order_id || null,
+      delivery_id: body.delivery_id || null,
+      notes: body.notes || "",
+      release_command: escrowId ? `ag3nt escrow-release ${escrowId}` : null,
+      raw: body,
+      status: order && delivery && escrowId ? "ready_to_release" : "missing_order_delivery_or_escrow"
+    };
+    db.acceptances.push(item);
+    if (order && item.status === "ready_to_release") order.status = "accepted_pending_release";
+    writeDb(db);
+    return send(res, 201, {
+      ok: true,
+      acceptance: item,
+      ui: ui("Acceptance recorded", item.release_command ? `Release funds with: ${item.release_command}` : "Attach order, delivery, and escrow before release.")
+    });
+  }
+
+  if (req.method === "GET" && url.pathname === "/acceptances") {
+    writeDb(db);
+    return send(res, 200, { acceptances: db.acceptances, ui: ui("Acceptances", "Accepted deliveries can be released on chain.") });
+  }
+
+  if (req.method === "POST" && url.pathname === "/refunds") {
+    const order = db.orders.find((candidate) => candidate.id === body.order_id);
+    const escrowId = order && order.escrow_id;
+    const item = {
+      id: id("refund"),
+      at: new Date().toISOString(),
+      actor,
+      order_id: body.order_id || null,
+      reason: body.reason || "",
+      refund_command: escrowId ? `ag3nt escrow-refund ${escrowId}` : null,
+      raw: body,
+      status: escrowId ? "refund_requested" : "missing_escrow"
+    };
+    db.refunds.push(item);
+    if (order && order.status !== "accepted_pending_release") order.status = "refund_requested";
+    writeDb(db);
+    return send(res, 201, {
+      ok: true,
+      refund: item,
+      ui: ui("Refund path recorded", item.refund_command ? `Try refund with: ${item.refund_command}; open /disputes if refund is blocked.` : "No escrow id is attached to this order.")
+    });
+  }
+
+  if (req.method === "GET" && url.pathname === "/refunds") {
+    writeDb(db);
+    return send(res, 200, { refunds: db.refunds, ui: ui("Refunds", "Refund requests and chain commands.") });
+  }
+
   if (req.method === "POST" && url.pathname === "/reviews") {
     const order = db.orders.find((candidate) => candidate.id === body.order_id);
     const hasDelivery = db.deliveries.some((candidate) => candidate.order_id === body.order_id);
+    const accepted = db.acceptances.some((candidate) => candidate.order_id === body.order_id && candidate.status === "ready_to_release");
     const item = {
       id: id("review"),
       at: new Date().toISOString(),
@@ -791,7 +864,7 @@ async function handle(req, res) {
       message: body.message || "",
       would_pay_again: body.would_pay_again ?? null,
       raw: body,
-      status: order && order.status === "funded" && hasDelivery ? "verified_review" : "unverified_review"
+      status: order && hasDelivery && accepted ? "verified_review" : "unverified_review"
     };
     db.reviews.push(item);
     writeDb(db);

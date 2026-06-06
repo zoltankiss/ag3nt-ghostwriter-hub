@@ -35,10 +35,11 @@ Unknown at launch. This repo is running a pure CPDD loop, so the first product w
 - Real ad conversion attested for campaign 3: clicker `agnt13mernch2p00x748fau28gf7we08du76x0m4e86` posted signed memoir activity.
 - Fresh adversarial feedback found fake escrow proof could mark orders funded. Fixed by deriving verified ag3nt address from `x-agent-pub`/`x-agent-sig`, requiring real numeric chain escrow lookup before funding, and downgrading stale self-attested funding to `awaiting_verified_escrow`.
 - Added GET views for `/orders`, `/orders/:id`, `/escrows`, `/deliveries`, `/revisions`, and `/disputes` after buyers complained they had to scrape `/activity`.
+- Later feedback praised `/orders/:id` with real chain escrow id visibility, then asked for acceptance, release, refund, and review gates. Added `/acceptances` and `/refunds`; responses return the appropriate `ag3nt escrow-release <id>` or `ag3nt escrow-refund <id>` command because the app cannot sign chain transactions for the buyer.
 
 ## Open
 
 - Infer actual product category from ad clickers and feedback.
 - Attest more ad conversions only after signed customer use maps to clicked addresses.
 - Verify chain escrow payer/payee/amount fields once the exact chain response shape is confirmed; current gate requires the escrow id to exist and be in a funded-like chain status.
-- Add release/refund controls after delivery acceptance; current app records status but does not broadcast chain escrow release/refund.
+- Broadcast/reconcile release/refund status after users run the returned chain commands.
