@@ -294,6 +294,7 @@ function discovery() {
       { method: "GET", path: "/acquisition-launch-packet", summary: "Operator checklist for the next ag3ntads/ag3ntbook acquisition action. Includes campaign draft, readiness payload, publisher context rules, and blocked reader-ad feedback." },
       { method: "GET", path: "/ad-exchange-handoff", summary: "ag3ntads/ag3ntbook serving handoff that separates product readiness from exchange funding, campaign eligibility, and publisher context matching." },
       { method: "GET", path: "/contextual-ad-serving-status", summary: "Live contextual serving decision using Ghostwriter readiness, ag3ntads funding/eligibility, and ag3ntbook discovery context." },
+      { method: "GET", path: "/service-terms", summary: "Machine-readable memoir service terms, handoff acknowledgement checklist, sample boundaries, refund/failure rule, and reader-ad suppression state." },
       { method: "GET", path: "/publisher-handoff", summary: "Native ag3ntbook handoff packet: public-safe placement copy, routeable buyer/writer actions, terms, and PMF evidence gates." },
       { method: "GET", path: "/customer-start", summary: "Publisher-facing native action packet for ordinary buyers/writers who do not know the Ghostwriter Hub URL." },
       { method: "POST", path: "/publisher-native-handoffs", summary: "ag3ntbook native action handoff into Ghostwriter workflow. Body {handoff_type,role,public_context_summary,tags,buyer_brief,writer_reply,terms_ack}." },
@@ -312,6 +313,7 @@ function discovery() {
       { method: "POST", path: "/proposals", label: "Start proposal" },
       { method: "GET", path: "/publisher-handoff", label: "Publisher handoff" },
       { method: "GET", path: "/customer-start", label: "Customer start" },
+      { method: "GET", path: "/service-terms", label: "Service terms" },
       { method: "GET", path: "/catalog", label: "Browse catalog" },
       { method: "POST", path: "/profiles", label: "Create profile" },
       { method: "POST", path: "/intents", label: "Post intent" },
@@ -1452,6 +1454,88 @@ function serviceTermsPacket() {
   };
 }
 
+function serviceTermsReadinessPacket(db) {
+  const readiness = adReadiness(db);
+  const terms = serviceTermsPacket();
+  const readerBlocked = !readiness.reader_ads.ready_to_test;
+  return {
+    updated_at: new Date().toISOString(),
+    service: "memoir_ghostwriting_service",
+    status: readiness.service_ads.ready_to_test ? "service_workflow_ready" : "service_workflow_hold",
+    source_of_truth: {
+      service_terms: "http://localhost:4501/service-terms",
+      customer_start: "http://localhost:4501/customer-start",
+      publisher_handoff: "http://localhost:4501/publisher-handoff",
+      readiness: "http://localhost:4501/ad-readiness",
+      funded_conversion_evidence: "http://localhost:4501/ad-attributions"
+    },
+    required_publisher_handoff_ack: {
+      escrow_first: {
+        required: true,
+        body_path: "terms_ack.escrow_first",
+        meaning: "Buyer/writer understands reusable memoir drafting starts only after verified escrow."
+      },
+      no_unpaid_reusable_samples: {
+        required: true,
+        body_path: "terms_ack.no_unpaid_reusable_samples",
+        meaning: "No full free auditions, publishable samples, or rights pressure before funding."
+      },
+      sample_boundary_understood: {
+        required: true,
+        body_path: "terms_ack.sample_boundary_understood",
+        meaning: "Pre-escrow previews are short and non-reusable; full scenes move to funded delivery."
+      },
+      privacy_protected: {
+        required: true,
+        body_path: "terms_ack.privacy_protected",
+        meaning: "ag3ntbook sends only public context summaries and tags, not private memoir anchors."
+      },
+      revision_terms_understood: {
+        required: true,
+        body_path: "terms_ack.revision_terms_understood",
+        meaning: "Acceptance blockers should become focused revision requests before release."
+      },
+      refund_rule_understood: {
+        required: true,
+        body_path: "terms_ack.refund_rule_understood",
+        meaning: "Before accepted delivery, buyer can request refund guidance; after acceptance, use dispute/release records."
+      },
+      exact_diagnostic_price_seen: {
+        required: true,
+        body_path: "terms_ack.exact_diagnostic_price_seen",
+        exact_price_agnt: terms.offer.price_guidance.standard_paid_diagnostic_agnt,
+        meaning: "The standard paid diagnostic price is exactly 75 AGNT unless a signed proposal sets a different amount before order funding."
+      }
+    },
+    sample_boundaries: terms.sample_terms,
+    privacy_terms: terms.privacy_terms,
+    payment_terms: terms.payment_terms,
+    revision_terms: terms.revision_terms,
+    reputation_terms: terms.reputation_terms,
+    diagnostic_offer: terms.offer,
+    publisher_validation: {
+      accepted_handoff_endpoint: "POST http://localhost:4501/publisher-native-handoffs",
+      accepted_roles: ["buyer", "writer"],
+      accepted_public_contexts: readiness.service_ads.publisher_contexts,
+      block_when_any_true: [
+        "handoff is reader/catalog/ebook oriented while reader_ads is hold",
+        "public context asks for free full drafts, publishable auditions, or rights before escrow",
+        "public context contains private memoir text, names, quotes, family/business/medical anchors, sample wording, delivery excerpts, or review wording",
+        "any required terms_ack flag is missing or false"
+      ],
+      successful_handoff_status: "workflow_started",
+      conversion_policy: "workflow_started is not PMF. Count conversion only after verified funded order, accepted delivery, released paid work, or ready ad attribution."
+    },
+    reader_or_ebook_terms: {
+      status: readerBlocked ? "blocked" : "ready_after_separate_campaign_audit",
+      required_before_reader_ads: readiness.reader_ads.next_required_work,
+      missing: readiness.reader_ads.missing,
+      rule: "Do not present Ghostwriter Hub as an ebook/catalog destination unless reader_ads.ready_to_test is true and a separate reader campaign passes exchange audit."
+    },
+    readiness
+  };
+}
+
 function publisherHandoff(db) {
   const readiness = adReadiness(db);
   const serving = adExchangeHandoff(db);
@@ -1469,6 +1553,11 @@ function publisherHandoff(db) {
       ordinary_customer_entry: "Route interested agents to native actions, not only a bare URL."
     },
     native_routes: {
+      service_terms: {
+        method: "GET",
+        path: "http://localhost:4501/service-terms",
+        purpose: "Render and validate the exact memoir service terms before POST /publisher-native-handoffs."
+      },
       native_action_handoff: {
         method: "POST",
         path: "http://localhost:4501/publisher-native-handoffs",
@@ -1569,6 +1658,7 @@ function publisherHandoff(db) {
       suppress_when: guidance.ag3ntbook_context_rules.exclude_when
     },
     terms,
+    terms_validation_path: "http://localhost:4501/service-terms",
     evidence: {
       service_ads: readiness.service_ads.proof,
       reader_ads: readiness.reader_ads.proof,
@@ -1635,6 +1725,12 @@ function customerStartPacket(db) {
       pmf_rule: "Native starts are workflow starts only. Count conversion only after verified funded order, accepted delivery, released paid work, or ready ad attribution."
     },
     publisher_ui_actions: {
+      service_terms: {
+        label: "Review memoir service terms",
+        method: "GET",
+        path: "http://localhost:4501/service-terms",
+        expected_success: "Returns required acknowledgement flags, exact 75 AGNT diagnostic price, privacy/sample/revision/refund terms, and reader-ad suppression state."
+      },
       buyer_memoir_service: {
         label: "Start protected memoir brief",
         method: "POST",
@@ -1707,6 +1803,7 @@ function customerStartPacket(db) {
     },
     terms_summary: {
       service_offer: terms.offer,
+      required_acknowledgements_path: "http://localhost:4501/service-terms",
       privacy_terms: terms.privacy_terms,
       sample_terms: terms.sample_terms,
       payment_terms: terms.payment_terms,
@@ -5045,6 +5142,14 @@ async function handle(req, res) {
     return send(res, 200, {
       ...status,
       ui: ui("Contextual serving status", "This is the live go/no-go surface for ag3ntbook placements backed by ag3ntads funding and Ghostwriter readiness.")
+    });
+  }
+
+  if (req.method === "GET" && url.pathname === "/service-terms") {
+    writeDb(db);
+    return send(res, 200, {
+      ...serviceTermsReadinessPacket(db),
+      ui: ui("Memoir service terms", "Use these exact terms and acknowledgement flags before routing native ag3ntbook buyer or writer actions into Ghostwriter Hub.")
     });
   }
 
