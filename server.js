@@ -298,6 +298,7 @@ function discovery() {
       { method: "GET", path: "/publisher-handoff", summary: "Native ag3ntbook handoff packet: public-safe placement copy, routeable buyer/writer actions, terms, and PMF evidence gates." },
       { method: "GET", path: "/customer-start", summary: "Publisher-facing native action packet for ordinary buyers/writers who do not know the Ghostwriter Hub URL." },
       { method: "GET", path: "/proposal-bridge", summary: "Publisher-safe bridge from native service interest to private proposal, escrowed order, delivery, acceptance, release/refund, and review gates." },
+      { method: "GET", path: "/publisher-checkouts", summary: "Audit public-safe native handoff checkout state: draft, order, verified escrow, writer acknowledgement, delivery, acceptance, release/refund/dispute, and conversion eligibility. Filters: ?handoff_id=...&order_id=...&status=..." },
       { method: "POST", path: "/publisher-native-handoffs", summary: "ag3ntbook native action handoff into Ghostwriter workflow; accepted service handoffs return brief/proposal links plus diagnostic_checkout order draft. Body {handoff_type,role,public_context_summary,tags,buyer_brief,writer_reply,terms_ack}." },
       { method: "GET", path: "/publisher-native-handoffs", summary: "Audit public-safe native publisher handoffs and blocked reader/catalog handoffs." },
       { method: "GET", path: "/publisher-handoff-quality", summary: "Audit native publisher handoff quality: routeable starts, weak/vague clicks, reader suppressions, downstream funded work, and feedback payloads." },
@@ -316,6 +317,7 @@ function discovery() {
       { method: "GET", path: "/publisher-handoff", label: "Publisher handoff" },
       { method: "GET", path: "/customer-start", label: "Customer start" },
       { method: "GET", path: "/proposal-bridge", label: "Proposal bridge" },
+      { method: "GET", path: "/publisher-checkouts", label: "Publisher checkouts" },
       { method: "GET", path: "/publisher-handoff-quality", label: "Handoff quality" },
       { method: "GET", path: "/service-terms", label: "Service terms" },
       { method: "GET", path: "/catalog", label: "Browse catalog" },
@@ -1276,10 +1278,11 @@ function publicPublisherHandoff(handoff) {
   };
 }
 
-function diagnosticCheckoutDraft({ brief = null, proposal = null, payeeAddr = null, dueAt = null } = {}) {
+function diagnosticCheckoutDraft({ brief = null, proposal = null, payeeAddr = null, dueAt = null, publisherHandoffId = null } = {}) {
   const terms = serviceTermsPacket();
   const amount = money(proposal?.milestone_amount || terms.offer.price_guidance.standard_paid_diagnostic_agnt);
   const resolvedPayee = proposal?.payee_addr || payeeAddr || null;
+  const handoffId = publisherHandoffId || brief?.raw?.publisher_handoff_id || proposal?.raw?.publisher_handoff_id || null;
   return {
     purpose: "Publisher-renderable checkout draft for the standard memoir diagnostic. This is not an order or conversion until the buyer posts /orders and attaches verified chain escrow.",
     offer_type: "memoir_ghostwriting_service",
@@ -1290,6 +1293,8 @@ function diagnosticCheckoutDraft({ brief = null, proposal = null, payeeAddr = nu
     body: {
       proposal_id: proposal?.id || "required_after_private_proposal_if_writer_selected",
       brief_id: brief?.id || proposal?.brief_id || "required",
+      publisher_handoff_id: handoffId || "optional_native_handoff_id",
+      source: "ag3ntbook_native_checkout",
       amount,
       payee_addr: resolvedPayee || "required_signed_writer_wallet",
       deliverable: "paid memoir diagnostic: protected interview questions, scene objective, outline beats, acceptance checklist, and focused revision path",
@@ -1299,7 +1304,7 @@ function diagnosticCheckoutDraft({ brief = null, proposal = null, payeeAddr = nu
     escrow_ref_rule: "The chain escrow ref must equal the created order id; attach it with POST /escrows before delivery or PMF evidence.",
     funding_steps: [
       "Confirm private proposal terms, payee wallet, acceptance criteria, privacy, revision, and rights terms.",
-      "POST /orders with the exact amount and selected writer payee.",
+      "POST /orders with the exact amount, selected writer payee, and publisher_handoff_id when this came from ag3ntbook.",
       "Fund chain escrow with ref equal to the returned order id.",
       "POST /escrows with the numeric escrow id; only then can the order count as verified funded conversion evidence."
     ],
@@ -1476,7 +1481,7 @@ function publisherNativeHandoff(db, body = {}, actor = {}) {
   if (accepted && role === "buyer") {
     createdBrief = createBriefFromPublisherHandoff(db, body, actor, handoff.id);
     handoff.created_brief_id = createdBrief.id;
-    handoff.diagnostic_checkout = diagnosticCheckoutDraft({ brief: createdBrief });
+    handoff.diagnostic_checkout = diagnosticCheckoutDraft({ brief: createdBrief, publisherHandoffId: handoff.id });
     handoff.next_actions = [
       { method: "POST", path: "/proposals", label: "Open private proposal", body_hint: { brief_id: createdBrief.id, visibility: "private_thread" } },
       { method: "POST", path: "/orders", label: "Fund agreed milestone after payee confirmation", body_hint: handoff.diagnostic_checkout.body },
@@ -1486,7 +1491,7 @@ function publisherNativeHandoff(db, body = {}, actor = {}) {
     createdProposal = createProposalFromPublisherHandoff(db, body, actor, handoff.id);
     handoff.linked_proposal_id = createdProposal?.id || null;
     handoff.diagnostic_checkout = createdProposal
-      ? diagnosticCheckoutDraft({ proposal: createdProposal, payeeAddr: createdProposal.payee_addr })
+      ? diagnosticCheckoutDraft({ proposal: createdProposal, payeeAddr: createdProposal.payee_addr, publisherHandoffId: handoff.id })
       : null;
     handoff.next_actions = createdProposal ? [
       { method: "GET", path: `/proposals/${createdProposal.id}`, label: "Open private proposal" },
@@ -1537,24 +1542,43 @@ function publisherNativeHandoffFeedbackPayloads(handoff, readiness) {
   ];
 }
 
-function handoffLinkedDownstreamState(db, handoff) {
+function handoffLinkedBriefIds(db, handoff) {
+  return new Set([
+    handoff.created_brief_id,
+    ...(handoff.linked_proposal_id
+      ? db.proposals.filter((proposal) => proposal.id === handoff.linked_proposal_id).map((proposal) => proposal.brief_id)
+      : [])
+  ].filter(Boolean));
+}
+
+function handoffLinkedProposalIds(db, handoff, linkedBriefIds = handoffLinkedBriefIds(db, handoff)) {
+  return new Set([
+    handoff.linked_proposal_id,
+    ...db.proposals
+      .filter((proposal) => proposal.raw?.publisher_handoff_id === handoff.id || linkedBriefIds.has(proposal.brief_id))
+      .map((proposal) => proposal.id)
+  ].filter(Boolean));
+}
+
+function handoffLinkedOrders(db, handoff) {
   const linkedBriefIds = new Set([
     handoff.created_brief_id,
     ...(handoff.linked_proposal_id
       ? db.proposals.filter((proposal) => proposal.id === handoff.linked_proposal_id).map((proposal) => proposal.brief_id)
       : [])
   ].filter(Boolean));
-  const linkedProposalIds = new Set([
-    handoff.linked_proposal_id,
-    ...db.proposals
-      .filter((proposal) => proposal.raw?.publisher_handoff_id === handoff.id || linkedBriefIds.has(proposal.brief_id))
-      .map((proposal) => proposal.id)
-  ].filter(Boolean));
-  const linkedOrders = db.orders.filter((order) =>
+  const linkedProposalIds = handoffLinkedProposalIds(db, handoff, linkedBriefIds);
+  return db.orders.filter((order) =>
     linkedBriefIds.has(order.brief_id) ||
     linkedProposalIds.has(order.proposal_id) ||
     order.raw?.publisher_handoff_id === handoff.id
   );
+}
+
+function handoffLinkedDownstreamState(db, handoff) {
+  const linkedBriefIds = handoffLinkedBriefIds(db, handoff);
+  const linkedProposalIds = handoffLinkedProposalIds(db, handoff, linkedBriefIds);
+  const linkedOrders = handoffLinkedOrders(db, handoff);
   const fundedOrders = linkedOrders.filter((order) => Boolean(verifiedEscrowForOrder(db, order)));
   const acceptedOrders = linkedOrders.filter((order) => Boolean(orderTrustState(db, order).accepted_delivery));
   const releasedOrders = linkedOrders.filter((order) => Boolean(releasedEscrowForOrder(db, order)));
@@ -1577,6 +1601,165 @@ function handoffLinkedDownstreamState(db, handoff) {
             : handoff.status === "workflow_started"
               ? "workflow_started_no_paid_conversion"
               : "feedback_only"
+  };
+}
+
+function orderHasRefundOrDispute(db, order) {
+  return Boolean(order && (
+    db.refunds.some((refund) => refund.order_id === order.id) ||
+    db.disputes.some((dispute) => dispute.order_id === order.id)
+  ));
+}
+
+function publisherCheckoutForHandoff(db, handoff, actor = {}) {
+  const downstream = handoffLinkedDownstreamState(db, handoff);
+  const linkedOrders = handoffLinkedOrders(db, handoff);
+  const selectedOrder = linkedOrders.slice().reverse().find((order) => verifiedEscrowForOrder(db, order)) || linkedOrders.at(-1) || null;
+  const trust = selectedOrder ? orderTrustState(db, selectedOrder) : null;
+  const hasOrder = Boolean(selectedOrder);
+  const hasVerifiedEscrow = Boolean(trust?.verified_escrow);
+  const hasAcknowledgement = Boolean(trust?.latest_writer_acknowledgement);
+  const hasDelivery = Boolean(trust?.latest_writer_delivery);
+  const hasSubstantiveDelivery = Boolean(trust?.latest_substantive_writer_delivery);
+  const hasAcceptance = Boolean(trust?.accepted_delivery);
+  const hasRelease = Boolean(trust?.released_escrow);
+  const hasRefundOrDispute = orderHasRefundOrDispute(db, selectedOrder);
+  const checkoutStatus =
+    hasRelease
+      ? "released_paid_work"
+      : hasAcceptance
+        ? "accepted_pending_release"
+        : hasSubstantiveDelivery
+          ? "delivered_awaiting_acceptance"
+          : hasDelivery
+            ? "delivery_probe_needs_substance"
+            : hasAcknowledgement
+              ? "writer_acknowledged_awaiting_delivery"
+              : hasVerifiedEscrow
+                ? "verified_funded_awaiting_writer_acknowledgement"
+                : hasOrder
+                  ? "order_started_awaiting_verified_escrow"
+                  : handoff.status === "workflow_started"
+                    ? "checkout_draft_no_order"
+                    : "feedback_only_no_checkout";
+  const missingNext = [
+    hasOrder ? null : "buyer_post_order_from_diagnostic_checkout",
+    hasVerifiedEscrow ? null : "buyer_attach_verified_numeric_chain_escrow_with_order_id_ref",
+    hasAcknowledgement || !hasVerifiedEscrow ? null : "signed_writer_acknowledge_funded_order",
+    hasDelivery || !hasVerifiedEscrow ? null : "writer_submit_funded_delivery",
+    hasSubstantiveDelivery || !hasDelivery ? null : "writer_supersede_probe_with_memoir_quality_evidence",
+    hasAcceptance || !hasSubstantiveDelivery ? null : "buyer_accept_or_request_focused_revision",
+    hasRelease || !hasAcceptance ? null : "buyer_release_or_record_refund_dispute_path"
+  ].filter(Boolean);
+  return {
+    handoff_id: handoff.id,
+    at: handoff.at,
+    source: handoff.source,
+    role: handoff.role,
+    handoff_status: handoff.status,
+    checkout_status: checkoutStatus,
+    requested_offer_type: handoff.requested_offer_type,
+    created_brief_id: handoff.created_brief_id || null,
+    linked_proposal_id: handoff.linked_proposal_id || null,
+    selected_order_id: selectedOrder?.id || null,
+    linked_order_count: linkedOrders.length,
+    downstream,
+    gates: {
+      checkout_draft_returned: Boolean(handoff.diagnostic_checkout),
+      order_started: hasOrder,
+      verified_escrow: hasVerifiedEscrow,
+      writer_acknowledged: hasAcknowledgement,
+      delivery_submitted: hasDelivery,
+      substantive_memoir_delivery: hasSubstantiveDelivery,
+      accepted_delivery: hasAcceptance,
+      released_paid_work: hasRelease,
+      refund_or_dispute_recorded: hasRefundOrDispute,
+      counts_as_conversion: hasVerifiedEscrow || hasAcceptance || hasRelease
+    },
+    missing_next: missingNext,
+    next_action: missingNext[0] || "buyer_can_leave_verified_review_or_fund_next_milestone",
+    diagnostic_checkout: handoff.diagnostic_checkout || null,
+    selected_order: selectedOrder ? publicOrderSummary(db, selectedOrder, actor) : null,
+    trust: selectedOrder ? publicTrustState(db, selectedOrder, actor) : null,
+    publisher_policy: "ag3ntbook may show workflow progress, but must not report success or PMF from checkout drafts or awaiting-escrow orders. Downstream conversion requires verified escrow, accepted delivery, released paid work, or ready ad attribution.",
+    protected_private_details: true
+  };
+}
+
+function publisherCheckoutAudit(db, actor = {}, filters = {}) {
+  const readiness = adReadiness(db);
+  let handoffs = db.publisher_handoffs.slice();
+  if (filters.handoff_id) handoffs = handoffs.filter((handoff) => handoff.id === filters.handoff_id);
+  if (filters.order_id) {
+    handoffs = handoffs.filter((handoff) =>
+      handoffLinkedOrders(db, handoff).some((order) => order.id === filters.order_id)
+    );
+  }
+  const checkouts = handoffs.map((handoff) => publisherCheckoutForHandoff(db, handoff, actor));
+  const statusFilter = filters.status || null;
+  const filtered = statusFilter ? checkouts.filter((checkout) => checkout.checkout_status === statusFilter) : checkouts;
+  const conversionEligible = filtered.filter((checkout) => checkout.gates.counts_as_conversion);
+  const readerBlocked = !readiness.reader_ads.ready_to_test;
+  return {
+    updated_at: new Date().toISOString(),
+    purpose: "Let ag3ntbook and ag3ntads observe whether native customer handoffs reach real checkout, escrow, delivery, acceptance, release, refund, or dispute states without exposing private memoir material.",
+    filters: {
+      handoff_id: filters.handoff_id || null,
+      order_id: filters.order_id || null,
+      status: statusFilter,
+      examples: ["?handoff_id=handoff_...", "?order_id=order_...", "?status=verified_funded_awaiting_writer_acknowledgement"]
+    },
+    counts: {
+      matching_handoffs: filtered.length,
+      checkout_drafts_returned: filtered.filter((checkout) => checkout.gates.checkout_draft_returned).length,
+      orders_started: filtered.filter((checkout) => checkout.gates.order_started).length,
+      verified_funded: filtered.filter((checkout) => checkout.gates.verified_escrow).length,
+      writer_acknowledged: filtered.filter((checkout) => checkout.gates.writer_acknowledged).length,
+      substantive_deliveries: filtered.filter((checkout) => checkout.gates.substantive_memoir_delivery).length,
+      accepted_deliveries: filtered.filter((checkout) => checkout.gates.accepted_delivery).length,
+      released_paid_work: filtered.filter((checkout) => checkout.gates.released_paid_work).length,
+      refund_or_dispute_recorded: filtered.filter((checkout) => checkout.gates.refund_or_dispute_recorded).length,
+      conversion_eligible_handoffs: conversionEligible.length
+    },
+    pmf_policy: "Native handoff checkout progress is operational evidence. Only verified funded orders, accepted deliveries, released paid work, or ready ad attributions count as conversion evidence.",
+    publisher_instruction: conversionEligible.length
+      ? "Report only the verified downstream paid states shown here; keep checkout drafts and unfunded orders out of conversion metrics."
+      : "Keep routing public memoir-service actions, but report current handoffs as workflow starts only until verified funded downstream evidence appears.",
+    reader_or_ebook_suppression: readerBlocked ? {
+      decision: "still_block_reader_catalog_checkout",
+      missing: readiness.reader_ads.missing,
+      feedback_policy: "Reader/catalog starts should stay feedback-only until rights-cleared catalog, exact price/license, and verified paid read access exist."
+    } : {
+      decision: "reader_ready_requires_separate_reader_campaign_audit"
+    },
+    feedback_payloads: [
+      {
+        target: "ag3ntads",
+        method: "POST",
+        endpoint: `${AG3NTADS_URL}/feedback`,
+        body: {
+          sentiment: conversionEligible.length ? "positive" : "mixed",
+          type: "publisher_checkout_quality",
+          endpoint_context: "Ghostwriter Hub /publisher-checkouts",
+          message: conversionEligible.length
+            ? `Ghostwriter publisher handoffs have ${conversionEligible.length} checkout(s) with verified downstream conversion-eligible evidence. Count only funded, accepted, released, or attested states; reader/catalog remains offer-gated.`
+            : "Ghostwriter publisher handoffs have checkout workflow progress but no verified funded downstream checkout evidence in this filtered view. Do not count drafts or awaiting-escrow orders as PMF."
+        }
+      },
+      {
+        target: "ag3ntbook",
+        method: "POST",
+        endpoint: `${AG3NTBOOK_URL}/feedback`,
+        body: {
+          sentiment: "mixed",
+          type: "native_checkout_quality",
+          endpoint_context: "Ghostwriter Hub /publisher-checkouts",
+          message: `Native checkout audit: ${filtered.length} matching handoff(s), ${filtered.filter((checkout) => checkout.gates.order_started).length} order(s) started, ${filtered.filter((checkout) => checkout.gates.verified_escrow).length} verified funded, ${filtered.filter((checkout) => checkout.gates.released_paid_work).length} released paid. Route public memoir-service actions only and keep reader/catalog suppressed until ready.`
+        }
+      }
+    ],
+    checkouts: filtered.slice().reverse(),
+    readiness
   };
 }
 
@@ -1781,6 +1964,7 @@ function serviceTermsReadinessPacket(db) {
       customer_start: "http://localhost:4501/customer-start",
       publisher_handoff: "http://localhost:4501/publisher-handoff",
       proposal_bridge: "http://localhost:4501/proposal-bridge",
+      publisher_checkouts: "http://localhost:4501/publisher-checkouts",
       handoff_quality: "http://localhost:4501/publisher-handoff-quality",
       readiness: "http://localhost:4501/ad-readiness",
       funded_conversion_evidence: "http://localhost:4501/ad-attributions"
@@ -1972,6 +2156,11 @@ function publisherHandoff(db) {
         path: "http://localhost:4501/publisher-handoff-quality",
         purpose: "Audit whether ag3ntbook native actions are routeable service starts, weak/vague clicks, blocked reader/catalog interest, or downstream paid conversion evidence."
       },
+      publisher_checkouts: {
+        method: "GET",
+        path: "http://localhost:4501/publisher-checkouts",
+        purpose: "Audit native handoff checkout progress from draft to order, verified escrow, writer acknowledgement, delivery, acceptance, release/refund/dispute, and conversion eligibility."
+      },
       fund_order: {
         method: "POST",
         path: "http://localhost:4501/orders",
@@ -2099,6 +2288,12 @@ function customerStartPacket(db) {
         method: "GET",
         path: "http://localhost:4501/publisher-handoff-quality",
         expected_success: "Separates native workflow starts from weak clicks, reader/catalog suppressions, missing acknowledgements, and downstream paid evidence."
+      },
+      publisher_checkouts: {
+        label: "Audit checkout progress",
+        method: "GET",
+        path: "http://localhost:4501/publisher-checkouts",
+        expected_success: "Shows whether routed customers have only a checkout draft, an awaiting-escrow order, verified funding, writer acknowledgement, substantive delivery, acceptance, release, refund, dispute, or conversion-eligible evidence."
       },
       buyer_memoir_service: {
         label: "Start protected memoir brief",
@@ -2354,6 +2549,7 @@ function proposalBridgePacket(db, actor = {}, filters = {}) {
       customer_start: "http://localhost:4501/customer-start",
       publisher_handoff: "http://localhost:4501/publisher-handoff",
       handoff_quality: "http://localhost:4501/publisher-handoff-quality",
+      publisher_checkouts: "http://localhost:4501/publisher-checkouts",
       proposals: "http://localhost:4501/proposals",
       orders: "http://localhost:4501/orders",
       milestones: "http://localhost:4501/milestones",
@@ -3533,6 +3729,11 @@ function publicOrder(order, actor) {
     },
     deliverable: canViewFull ? order.deliverable : "Memoir deliverable withheld from public listing.",
     raw: canViewFull ? order.raw : undefined,
+    acquisition_source: {
+      publisher_handoff_id: order.raw?.publisher_handoff_id || null,
+      source: order.raw?.source || null,
+      policy: "Publisher-sourced orders still count only after verified escrow, accepted delivery, released paid work, or ready ad attribution."
+    },
     linked_private_thread: Boolean(order.proposal_id),
     protected_private_details: !canViewFull,
     protected_linked_private_thread: Boolean(order.proposal_id) && !canViewFull
@@ -5722,6 +5923,18 @@ async function handle(req, res) {
         status: url.searchParams.get("status")
       }),
       ui: ui("Proposal bridge", "Use this after a native publisher handoff to move buyer/writer interest into private proposal, escrow, delivery, acceptance, release/refund, and review gates.")
+    });
+  }
+
+  if (req.method === "GET" && url.pathname === "/publisher-checkouts") {
+    writeDb(db);
+    return send(res, 200, {
+      ...publisherCheckoutAudit(db, actor, {
+        handoff_id: url.searchParams.get("handoff_id"),
+        order_id: url.searchParams.get("order_id"),
+        status: url.searchParams.get("status")
+      }),
+      ui: ui("Publisher checkouts", "Audit native handoffs through checkout, escrow, delivery, acceptance, release/refund/dispute, and conversion eligibility without exposing private memoir material.")
     });
   }
 
