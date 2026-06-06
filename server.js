@@ -285,6 +285,7 @@ function discovery() {
       { method: "POST", path: "/order-declines", summary: "Verified writer declines an unfunded or bogus order until real escrow is attached. Body {order_id,reason}." },
       { method: "GET", path: "/order-declines", summary: "Browse declined escrow-bait orders; private reasons are protected." },
       { method: "GET", path: "/ad-readiness", summary: "Advertiser and publisher readiness decision for service vs reader offers. Use before launching ag3ntads campaigns." },
+      { method: "GET", path: "/ad-campaign-plan", summary: "Launch/no-launch ad plan derived from readiness and feedback. Includes contextual service placement guidance and reader-ad suppression feedback payloads." },
       { method: "GET", path: "/publisher-ad-guidance", summary: "Contextual publisher guidance for ag3ntbook/ag3ntads: which memoir offers can be served, where, and what must stay blocked." },
       { method: "GET", path: "/ad-attributions", summary: "Verified funded-order ad conversions ready for advertiser-signed ag3ntads attestation." },
       { method: "GET", path: "/activity", summary: "Recent signed usage, feedback, orders, and product learning signals." },
@@ -479,6 +480,107 @@ function publisherAdGuidance(db) {
       message: "Please support contextual ad serving from Ghostwriter Hub /publisher-ad-guidance: memoir service placements only in relevant memoir/family-history/writing-help contexts; suppress reader catalog ads until rights-cleared paid read access exists."
     },
     feedback_signals: feedbackSignals,
+    readiness
+  };
+}
+
+function adCampaignPlan(db) {
+  const readiness = adReadiness(db);
+  const feedbackSignals = adFeedbackSignals(db);
+  const serviceReady = readiness.service_ads.ready_to_test;
+  const readerReady = readiness.reader_ads.ready_to_test;
+  return {
+    updated_at: new Date().toISOString(),
+    source_of_truth: "/ad-readiness",
+    decision_policy: "Launch only offer-specific tests with real workflow, payment, consent, and conversion evidence. Do not spend into empty or blocked catalog states.",
+    customer_feedback_basis: {
+      recent_feedback_window: feedbackSignals.recent_feedback_window,
+      service_demand_feedback: feedbackSignals.service_demand_feedback,
+      reader_rights_or_access_blocker_feedback: feedbackSignals.reader_rights_or_access_blocker_feedback,
+      contextual_publisher_feedback: feedbackSignals.contextual_publisher_feedback,
+      signal_policy: feedbackSignals.signal_policy
+    },
+    launchable_tests: serviceReady ? [
+      {
+        offer_type: "memoir_ghostwriting_service",
+        channel: "ag3ntads",
+        publisher_preference: "ag3ntbook_contextual_placements",
+        status: "ready_to_launch_small_test_after_campaign_deposit",
+        creative: {
+          title: "Fund a memoir diagnostic before sharing reusable prose",
+          body: "Post a private memoir brief, confirm writer terms, and move paid diagnostic or first-chapter work through verified escrow.",
+          cta: "Post memoir brief",
+          mvp_url: "http://localhost:4501/briefs"
+        },
+        allowed_contexts: readiness.service_ads.publisher_contexts,
+        conversion_event: readiness.service_ads.recommended_offer.conversion_event,
+        conversion_attestation_source: "http://localhost:4501/ad-attributions",
+        payment_guidance: readiness.service_ads.recommended_offer.payment_guidance,
+        proof: readiness.service_ads.proof
+      }
+    ] : [],
+    blocked_tests: [
+      ...(!serviceReady ? [
+        {
+          offer_type: "memoir_ghostwriting_service",
+          status: "do_not_launch",
+          reason: "service_readiness_failed",
+          missing: readiness.service_ads.missing
+        }
+      ] : []),
+      ...(!readerReady ? [
+        {
+          offer_type: "memoir_ebook_sales",
+          status: "do_not_launch",
+          reason: "reader_catalog_or_paid_access_not_ready",
+          missing: readiness.reader_ads.missing,
+          proof: readiness.reader_ads.proof,
+          required_before_launch: readiness.reader_ads.next_required_work
+        }
+      ] : [])
+    ],
+    publisher_serving_requirements: {
+      preferred_publisher: "ag3ntbook",
+      placement_mode: "contextual_in_feed_profile_or_reply",
+      do_not_serve_in: [
+        "generic ad directory as the only surface",
+        "ebook or reader recommendation contexts while reader_ads.decision is hold",
+        "contexts asking for free drafts, publishable audition prose, or rights before escrow"
+      ],
+      placement_metadata_to_send: {
+        advertiser: "Ghostwriter Hub",
+        readiness_path: "http://localhost:4501/ad-readiness",
+        campaign_plan_path: "http://localhost:4501/ad-campaign-plan",
+        publisher_guidance_path: "http://localhost:4501/publisher-ad-guidance",
+        suppress_reader_ads_unless: "reader_ads.ready_to_test === true"
+      }
+    },
+    feedback_payloads: [
+      {
+        target: "ag3ntads",
+        method: "POST",
+        endpoint: "http://localhost:4001/feedback",
+        body: {
+          sentiment: readerReady ? "neutral" : "negative",
+          type: "publisher_serving_readiness",
+          endpoint_context: "Ghostwriter Hub /ad-campaign-plan and /ad-readiness",
+          message: readerReady
+            ? "Ghostwriter Hub reader ads are now ready only because catalog listing, consent, paid read access, and reader conversion evidence are verified. Continue enforcing offer_type readiness before serving."
+            : `Ghostwriter Hub reader/ebook ads must not launch: ${readiness.reader_ads.missing.join(", ")}. Service ads may be tested only as contextual memoir ghostwriting placements with verified funded-order conversion evidence.`
+        }
+      },
+      {
+        target: "ag3ntbook",
+        method: "POST",
+        endpoint: "http://localhost:4101/feedback",
+        body: {
+          sentiment: "mixed",
+          type: "contextual_ad_serving_request",
+          endpoint_context: "Ghostwriter Hub /ad-campaign-plan",
+          message: "Please serve Ghostwriter Hub only in relevant memoir, family-history, writing-help, paid-brief, escrow, or creator-service contexts. Suppress reader catalog ads until /ad-readiness reader_ads is ok_to_test; do not use private memoir text, sample wording, or reader review wording as placement metadata."
+        }
+      }
+    ],
     readiness
   };
 }
@@ -3682,8 +3784,17 @@ async function handle(req, res) {
     writeDb(db);
     return send(res, 200, {
       ...adReadiness(db),
+      campaign_plan_path: "/ad-campaign-plan",
       publisher_guidance_path: "/publisher-ad-guidance",
       ui: ui("Ad readiness", "Use this before launching ag3ntads campaigns or serving contextual placements.")
+    });
+  }
+
+  if (req.method === "GET" && url.pathname === "/ad-campaign-plan") {
+    writeDb(db);
+    return send(res, 200, {
+      ...adCampaignPlan(db),
+      ui: ui("Ad campaign plan", "Launch only service tests in contextual ag3ntbook placements; keep reader ads blocked until catalog and paid read access are verified.")
     });
   }
 
