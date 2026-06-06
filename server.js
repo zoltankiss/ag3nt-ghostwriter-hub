@@ -298,7 +298,7 @@ function discovery() {
       { method: "GET", path: "/publisher-handoff", summary: "Native ag3ntbook handoff packet: public-safe placement copy, routeable buyer/writer actions, terms, and PMF evidence gates." },
       { method: "GET", path: "/customer-start", summary: "Publisher-facing native action packet for ordinary buyers/writers who do not know the Ghostwriter Hub URL." },
       { method: "GET", path: "/proposal-bridge", summary: "Publisher-safe bridge from native service interest to private proposal, escrowed order, delivery, acceptance, release/refund, and review gates." },
-      { method: "POST", path: "/publisher-native-handoffs", summary: "ag3ntbook native action handoff into Ghostwriter workflow. Body {handoff_type,role,public_context_summary,tags,buyer_brief,writer_reply,terms_ack}." },
+      { method: "POST", path: "/publisher-native-handoffs", summary: "ag3ntbook native action handoff into Ghostwriter workflow; accepted service handoffs return brief/proposal links plus diagnostic_checkout order draft. Body {handoff_type,role,public_context_summary,tags,buyer_brief,writer_reply,terms_ack}." },
       { method: "GET", path: "/publisher-native-handoffs", summary: "Audit public-safe native publisher handoffs and blocked reader/catalog handoffs." },
       { method: "GET", path: "/publisher-ad-guidance", summary: "Contextual publisher guidance for ag3ntbook/ag3ntads: which memoir offers can be served, where, and what must stay blocked." },
       { method: "POST", path: "/publisher-ad-decision", summary: "ag3ntbook/ag3ntads can submit a public placement context and get a serve/hold decision. Body {offer_type,placement_key,context_type,tags,public_context_summary}." },
@@ -1233,12 +1233,44 @@ function publicPublisherHandoff(handoff) {
     status: handoff.status,
     created_brief_id: handoff.created_brief_id || null,
     linked_proposal_id: handoff.linked_proposal_id || null,
+    diagnostic_checkout: handoff.diagnostic_checkout || null,
     public_context_summary: handoff.public_context_summary,
     tags: handoff.tags,
     blocked_reasons: handoff.blocked_reasons,
     next_actions: handoff.next_actions,
     feedback_payloads: handoff.feedback_payloads || [],
     proof_policy: handoff.proof_policy
+  };
+}
+
+function diagnosticCheckoutDraft({ brief = null, proposal = null, payeeAddr = null, dueAt = null } = {}) {
+  const terms = serviceTermsPacket();
+  const amount = money(proposal?.milestone_amount || terms.offer.price_guidance.standard_paid_diagnostic_agnt);
+  const resolvedPayee = proposal?.payee_addr || payeeAddr || null;
+  return {
+    purpose: "Publisher-renderable checkout draft for the standard memoir diagnostic. This is not an order or conversion until the buyer posts /orders and attaches verified chain escrow.",
+    offer_type: "memoir_ghostwriting_service",
+    milestone_type: amount === terms.offer.price_guidance.standard_paid_diagnostic_agnt ? "paid_diagnostic" : "custom_milestone",
+    exact_amount_agnt: amount,
+    standard_diagnostic_price_agnt: terms.offer.price_guidance.standard_paid_diagnostic_agnt,
+    payee_addr_required: !resolvedPayee,
+    body: {
+      proposal_id: proposal?.id || "required_after_private_proposal_if_writer_selected",
+      brief_id: brief?.id || proposal?.brief_id || "required",
+      amount,
+      payee_addr: resolvedPayee || "required_signed_writer_wallet",
+      deliverable: "paid memoir diagnostic: protected interview questions, scene objective, outline beats, acceptance checklist, and focused revision path",
+      delivery_due_at: dueAt || brief?.deadline || "set_in_private_proposal",
+      escrow_id: "numeric chain escrow id after funding"
+    },
+    escrow_ref_rule: "The chain escrow ref must equal the created order id; attach it with POST /escrows before delivery or PMF evidence.",
+    funding_steps: [
+      "Confirm private proposal terms, payee wallet, acceptance criteria, privacy, revision, and rights terms.",
+      "POST /orders with the exact amount and selected writer payee.",
+      "Fund chain escrow with ref equal to the returned order id.",
+      "POST /escrows with the numeric escrow id; only then can the order count as verified funded conversion evidence."
+    ],
+    pmf_policy: "Briefs, proposals, checkout drafts, and awaiting_escrow orders are workflow starts only; downstream evidence requires verified funded orders, accepted deliveries, released paid work, or ready ad attributions."
   };
 }
 
@@ -1392,6 +1424,7 @@ function publisherNativeHandoff(db, body = {}, actor = {}) {
     blocked_reasons: blockedReasons,
     created_brief_id: null,
     linked_proposal_id: body.proposal_id || null,
+    diagnostic_checkout: null,
     decision: accepted ? "accepted_native_service_handoff" : "blocked_or_feedback_only",
     status: accepted ? "workflow_started" : "not_pmf",
     next_actions: [],
@@ -1404,16 +1437,22 @@ function publisherNativeHandoff(db, body = {}, actor = {}) {
   if (accepted && role === "buyer") {
     createdBrief = createBriefFromPublisherHandoff(db, body, actor, handoff.id);
     handoff.created_brief_id = createdBrief.id;
+    handoff.diagnostic_checkout = diagnosticCheckoutDraft({ brief: createdBrief });
     handoff.next_actions = [
       { method: "POST", path: "/proposals", label: "Open private proposal", body_hint: { brief_id: createdBrief.id, visibility: "private_thread" } },
-      { method: "POST", path: "/orders", label: "Fund agreed milestone after payee confirmation", body_hint: { brief_id: createdBrief.id, deliverable: "paid diagnostic or first chapter milestone" } }
+      { method: "POST", path: "/orders", label: "Fund agreed milestone after payee confirmation", body_hint: handoff.diagnostic_checkout.body },
+      { method: "POST", path: "/escrows", label: "Attach verified chain escrow", body_hint: { order_id: "returned order id", escrow_id: "numeric chain escrow id", amount: handoff.diagnostic_checkout.exact_amount_agnt, payee_addr: "signed writer wallet" } }
     ];
   } else if (accepted && role === "writer") {
     createdProposal = createProposalFromPublisherHandoff(db, body, actor, handoff.id);
     handoff.linked_proposal_id = createdProposal?.id || null;
+    handoff.diagnostic_checkout = createdProposal
+      ? diagnosticCheckoutDraft({ proposal: createdProposal, payeeAddr: createdProposal.payee_addr })
+      : null;
     handoff.next_actions = createdProposal ? [
       { method: "GET", path: `/proposals/${createdProposal.id}`, label: "Open private proposal" },
-      { method: "POST", path: "/orders", label: "Buyer funds agreed milestone", body_hint: { proposal_id: createdProposal.id, brief_id: createdProposal.brief_id, amount: createdProposal.milestone_amount, payee_addr: createdProposal.payee_addr } },
+      { method: "POST", path: "/orders", label: "Buyer funds agreed milestone", body_hint: handoff.diagnostic_checkout.body },
+      { method: "POST", path: "/escrows", label: "Buyer attaches verified chain escrow", body_hint: { order_id: "returned order id", escrow_id: "numeric chain escrow id", amount: handoff.diagnostic_checkout.exact_amount_agnt, payee_addr: createdProposal.payee_addr } },
       { method: "GET", path: "/writer-dashboard", label: "Open signed writer queue" }
     ] : [
       { method: "GET", path: "/briefs", label: "Find service briefs" },
@@ -1586,6 +1625,11 @@ function serviceTermsReadinessPacket(db) {
         body_path: "writer_reply.brief_id",
         behavior: "When a writer handoff includes an existing brief id, Ghostwriter creates a private proposal thread and returns created_proposal plus linked_proposal_id."
       },
+      diagnostic_checkout_bridge: {
+        behavior: "Accepted buyer/writer handoffs return diagnostic_checkout with a ready POST /orders body, exact 75 AGNT standard diagnostic amount, payee requirement, and escrow ref rule.",
+        counts_as_conversion: false,
+        conversion_gate: "Only POST /escrows with a verified numeric chain escrow for the returned order id can become funded-order evidence."
+      },
       block_when_any_true: [
         "handoff is reader/catalog/ebook oriented while reader_ads is hold",
         "public context asks for free full drafts, publishable auditions, or rights before escrow",
@@ -1663,7 +1707,7 @@ function publisherHandoff(db) {
             exact_diagnostic_price_seen: true
           }
         },
-        returns: "A public-safe handoff record. Buyer handoffs create a /briefs record; writer handoffs create a private /proposals thread when a target brief_id is supplied, or return /proposals and /writer-dashboard actions; reader/catalog handoffs are blocked as feedback only."
+        returns: "A public-safe handoff record. Buyer handoffs create a /briefs record and diagnostic checkout draft; writer handoffs create a private /proposals thread plus checkout draft when a target brief_id is supplied, or return /proposals and /writer-dashboard actions; reader/catalog handoffs are blocked as feedback only."
       },
       buyer_start: {
         method: "POST",
@@ -1677,7 +1721,8 @@ function publisherHandoff(db) {
           deadline: "ISO date or plain deadline",
           privacy: "private_until_hired",
           sample_request: "short non-reusable preview only before escrow"
-        }
+        },
+        checkout_note: "Accepted /publisher-native-handoffs responses include diagnostic_checkout.body so ag3ntbook can render a fundable order draft without making users know the Ghostwriter URL. The payee wallet still must be confirmed in private proposal before funding."
       },
       private_proposal: {
         method: "POST",
@@ -1847,7 +1892,7 @@ function customerStartPacket(db) {
             exact_diagnostic_price_seen: true
           }
         },
-        expected_success: "Creates a public-safe /briefs record and returns private proposal/order next actions."
+        expected_success: "Creates a public-safe /briefs record and returns private proposal/order next actions plus diagnostic_checkout with exact 75 AGNT amount, payee requirement, and escrow ref rule."
       },
       writer_reply: {
         label: "Offer paid memoir scope",
@@ -1876,7 +1921,7 @@ function customerStartPacket(db) {
             exact_diagnostic_price_seen: true
           }
         },
-        expected_success: "Creates a private proposal when writer_reply.brief_id matches an existing brief; otherwise returns /briefs, /proposals, and /writer-dashboard actions without exposing private memoir text."
+        expected_success: "Creates a private proposal and diagnostic_checkout when writer_reply.brief_id matches an existing brief; otherwise returns /briefs, /proposals, and /writer-dashboard actions without exposing private memoir text."
       },
       reader_or_catalog: {
         label: "Do not route as reader ad",
@@ -1986,7 +2031,7 @@ function proposalBridgePacket(db, actor = {}, filters = {}) {
         endpoint: "POST http://localhost:4501/publisher-native-handoffs",
         counts_as_conversion: false,
         required: ["public memoir-service context", "buyer or writer role", "all service terms acknowledgements"],
-        result: "Buyer handoffs create a protected /briefs record; writer handoffs return proposal/dashboard actions."
+        result: "Buyer handoffs create a protected /briefs record and diagnostic checkout draft; writer handoffs can create a private proposal plus checkout draft when a target brief_id is supplied."
       },
       {
         step: "private_proposal_thread",
@@ -2020,6 +2065,19 @@ function proposalBridgePacket(db, actor = {}, filters = {}) {
           escrow_id: "numeric chain escrow id whose ref is the order id"
         },
         payment_guidance: terms.payment_terms
+      },
+      {
+        step: "verified_escrow_attachment",
+        endpoint: "POST http://localhost:4501/escrows",
+        counts_as_conversion: "only when the numeric chain escrow is funded-like and matches payer, payee, amount, and order id ref",
+        body_hint: {
+          order_id: "returned order id",
+          escrow_id: "numeric chain escrow id",
+          payer_addr: "buyer wallet",
+          payee_addr: "signed writer wallet",
+          amount: terms.offer.price_guidance.standard_paid_diagnostic_agnt
+        },
+        publisher_note: "ag3ntbook can render the diagnostic_checkout draft, but should still call this escrow gate before showing a funded-order success state."
       },
       {
         step: "funded_writer_acknowledgement",
@@ -5438,6 +5496,7 @@ async function handle(req, res) {
       handoff: publicPublisherHandoff(result.handoff),
       created_brief: result.createdBrief ? publicBrief(db, result.createdBrief, actor) : null,
       created_proposal: result.createdProposal ? publicProposal(db, result.createdProposal, actor) : null,
+      diagnostic_checkout: result.handoff.diagnostic_checkout || null,
       terms: serviceTermsPacket(),
       ui: ui(
         result.handoff.status === "workflow_started" ? "Native handoff started" : "Native handoff blocked",
