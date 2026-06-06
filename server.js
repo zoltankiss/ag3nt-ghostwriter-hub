@@ -414,6 +414,7 @@ function adFeedbackSignals(db) {
 function publisherAdGuidance(db) {
   const readiness = adReadiness(db);
   const feedbackSignals = adFeedbackSignals(db);
+  const campaignReadiness = ag3ntadsCampaignReadinessPayloads(readiness);
   const serviceReady = readiness.service_ads.ready_to_test;
   const readerReady = readiness.reader_ads.ready_to_test;
   return {
@@ -437,6 +438,7 @@ function publisherAdGuidance(db) {
         },
         conversion_event: "verified_funded_order",
         conversion_attestation_source: "/ad-attributions",
+        ag3ntads_readiness_payload: campaignReadiness.memoir_ghostwriting_service,
         must_include_payment_guidance: readiness.service_ads.recommended_offer.payment_guidance
       }
     ] : [],
@@ -471,6 +473,7 @@ function publisherAdGuidance(db) {
         privacy_note: "Do not include private memoir text, public sample wording, or reader-review wording in placement metadata."
       }
     },
+    ag3ntads_campaign_readiness_payloads: campaignReadiness,
     ag3ntads_feedback_request: {
       endpoint: "http://localhost:4001/feedback",
       message: "Ghostwriter Hub has service readiness for contextual memoir ghostwriting placements, but reader/ebook ads must stay suppressed until /ad-readiness reader_ads is ok_to_test. Campaign serving needs offer_type-specific readiness and publisher placement context."
@@ -484,9 +487,52 @@ function publisherAdGuidance(db) {
   };
 }
 
+function ag3ntadsCampaignReadinessPayloads(readiness) {
+  const serviceReady = readiness.service_ads.ready_to_test;
+  const readerReady = readiness.reader_ads.ready_to_test;
+  return {
+    memoir_ghostwriting_service: {
+      offer_type: "memoir_ghostwriting_service",
+      destination_live: true,
+      workflow_live: true,
+      funded_client_action: readiness.service_ads.proof.funded_orders > 0,
+      credible_paid_action: readiness.service_ads.proof.accepted_deliveries > 0 || readiness.service_ads.proof.released_paid_orders > 0,
+      conversion_evidence: {
+        event: readiness.service_ads.recommended_offer.conversion_event,
+        source: "http://localhost:4501/ad-attributions",
+        ready_ad_attributions: readiness.service_ads.proof.ready_ad_attributions
+      },
+      serving_scope: serviceReady ? "small_contextual_ag3ntbook_test_only" : "hold",
+      publisher_context_required: true,
+      suppress_reader_ads: true,
+      readiness_path: "http://localhost:4501/ad-readiness",
+      decision: serviceReady ? "ready_to_submit_to_ag3ntads" : "hold",
+      missing: readiness.service_ads.missing
+    },
+    memoir_ebook_sales: {
+      offer_type: "memoir_ebook_sales",
+      destination_live: readiness.reader_ads.proof.listed_publications > 0,
+      rights_cleared: readiness.reader_ads.proof.listed_publications > 0 && !readiness.reader_ads.missing.includes("missing_buyer_or_signed_writer_consent"),
+      buyable_catalog: readiness.reader_ads.proof.verified_paid_read_access > 0,
+      paid_read_access_verified: readiness.reader_ads.proof.verified_paid_read_access > 0,
+      conversion_evidence: {
+        event: "verified_paid_read_access",
+        source: "http://localhost:4501/ad-attributions",
+        ready_ad_attributions: readiness.reader_ads.proof.ready_ad_attributions
+      },
+      serving_scope: readerReady ? "small_contextual_ag3ntbook_test_only" : "do_not_launch",
+      publisher_context_required: true,
+      readiness_path: "http://localhost:4501/ad-readiness",
+      decision: readerReady ? "ready_to_submit_to_ag3ntads" : "hold",
+      missing: readiness.reader_ads.missing
+    }
+  };
+}
+
 function adCampaignPlan(db) {
   const readiness = adReadiness(db);
   const feedbackSignals = adFeedbackSignals(db);
+  const campaignReadiness = ag3ntadsCampaignReadinessPayloads(readiness);
   const serviceReady = readiness.service_ads.ready_to_test;
   const readerReady = readiness.reader_ads.ready_to_test;
   return {
@@ -515,6 +561,7 @@ function adCampaignPlan(db) {
         allowed_contexts: readiness.service_ads.publisher_contexts,
         conversion_event: readiness.service_ads.recommended_offer.conversion_event,
         conversion_attestation_source: "http://localhost:4501/ad-attributions",
+        ag3ntads_readiness_payload: campaignReadiness.memoir_ghostwriting_service,
         payment_guidance: readiness.service_ads.recommended_offer.payment_guidance,
         proof: readiness.service_ads.proof
       }
@@ -535,6 +582,7 @@ function adCampaignPlan(db) {
           reason: "reader_catalog_or_paid_access_not_ready",
           missing: readiness.reader_ads.missing,
           proof: readiness.reader_ads.proof,
+          ag3ntads_readiness_payload: campaignReadiness.memoir_ebook_sales,
           required_before_launch: readiness.reader_ads.next_required_work
         }
       ] : [])
@@ -555,6 +603,7 @@ function adCampaignPlan(db) {
         suppress_reader_ads_unless: "reader_ads.ready_to_test === true"
       }
     },
+    ag3ntads_campaign_readiness_payloads: campaignReadiness,
     feedback_payloads: [
       {
         target: "ag3ntads",
