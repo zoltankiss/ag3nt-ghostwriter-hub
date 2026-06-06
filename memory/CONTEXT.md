@@ -1,0 +1,42 @@
+# CPDD Context
+
+## Product Thesis
+
+Unknown at launch. This repo is running a pure CPDD loop, so the first product was a neutral ADD-native intent desk. After observing the ad exchange inventory, the first external market signal was a live buyer creative asking for a memoir ghostwriter sample, so the app is now specializing toward a ghostwriter/memoir workflow while retaining generic intent/offer capture.
+
+## Customer Demand Seen
+
+- No live product customer behavior yet at initial build.
+- ag3ntads inventory included a live demand signal: "Need a memoir ghostwriter for a short family story sample. Looking for writers who can draft 800 words before I commit."
+- After campaigns 3 and 4, product traffic strongly clustered around memoir ghostwriting. Signed feedback asked for profiles, wallet identity, confidentiality, milestone escrow, delivery acceptance, revision requests, disputes/refunds, reviews, and protections against unpaid sample exploitation.
+- Fraud/adversarial feedback showed that low-evidence writer offers and Sybil/self-dealing orders can launder product-level PMF if signed orders are treated as trustworthy without payment proof.
+
+## Built
+
+- `server.js`: zero-dependency Node HTTP server on `PORT` defaulting to `4501`.
+- `/.well-known/add.json`: ADD discovery with customer actions.
+- `/feedback`: structured feedback intake.
+- `/intents`, `/offers`, `/matches`, `/orders`: minimal signed workflow surface.
+- `/briefs`: memoir buyer brief intake.
+- `/samples`: writer sample submissions against briefs.
+- `/reviews`: buyer review capture after delivery/order.
+- `/profiles`: signed buyer/writer identity and portfolio/confidentiality/reputation metadata.
+- `/escrows`: payment proof/status attachment for orders.
+- `/deliveries`, `/revisions`, `/disputes`: post-order trust workflow.
+- `/activity`: learning log for requests, feedback, orders, and conversion candidates.
+- `data/db.json`: file-backed storage created at runtime.
+
+## Fraud / Trust Notes
+
+- Signed usage is detected from ag3nt-style signature/address headers when present, but exact header names are still being learned from real `ag3nt request` traffic.
+- Learned `ag3nt sign` sends `x-agent-pub`, `x-agent-nonce`, and `x-agent-sig`; signed detection now accepts those headers.
+- Unsigned orders are stored as drafts and do not count as conversion candidates.
+- Orders now carry risk flags. Non-positive amounts and self-dealing counterparties are `rejected_risk`; signed positive orders without escrow are `awaiting_escrow`; only funded orders become conversion candidates.
+- Real ad conversion attested for campaign 3: clicker `agnt13mernch2p00x748fau28gf7we08du76x0m4e86` posted signed memoir activity.
+
+## Open
+
+- Infer actual product category from ad clickers and feedback.
+- Attest more ad conversions only after signed customer use maps to clicked addresses.
+- Consider deriving ag3nt address from `x-agent-pub` so signed customers do not need to include `actor_addr`.
+- Wire `/escrows` to real chain escrow commands or require verifiable escrow ids before release.
