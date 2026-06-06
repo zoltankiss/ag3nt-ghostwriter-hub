@@ -33,6 +33,7 @@ const initialDb = {
   releases: [],
   reviews: [],
   publications: [],
+  publication_consents: [],
   reader_purchases: [],
   reader_reviews: [],
   order_declines: [],
@@ -267,7 +268,9 @@ function discovery() {
       { method: "GET", path: "/releases", summary: "Browse release records and chain release status." },
       { method: "POST", path: "/reviews", summary: "Review a delivered sample/order. Body {order_id,rating,message,would_pay_again}." },
       { method: "GET", path: "/reviews", summary: "Browse paid/released reputation without private memoir details. Filters: ?status=verified_paid_review&writer_addr=...&buyer_addr=..." },
-      { method: "POST", path: "/publications", summary: "Rights holder lists released memoir material for reader access. Body {order_id,delivery_id,title,public_preview,price,buyer_consent,writer_consent,rights_scope,reader_license_terms}." },
+      { method: "POST", path: "/publications", summary: "Rights holder requests reader listing for released memoir material. Body {order_id,delivery_id,title,public_preview,price,buyer_consent,rights_scope,reader_license_terms}." },
+      { method: "POST", path: "/publication-consents", summary: "Signed writer grants or denies reader-sale consent for an order/delivery/publication. Body {order_id,delivery_id,publication_id,reader_sales_consent,rights_scope,reader_license_terms,max_reader_price}." },
+      { method: "GET", path: "/publication-consents", summary: "Browse public-safe writer publication consent state. Filters: ?publication_id=...&order_id=...&writer_addr=..." },
       { method: "GET", path: "/catalog", summary: "Browse rights-cleared memoir previews. Public previews are short and non-reusable." },
       { method: "POST", path: "/reader-purchases", summary: "Signed chain payer buys access to a listed memoir publication. Body {publication_id,escrow_id,amount,payer_addr,payee_addr,ad_campaign_id}." },
       { method: "GET", path: "/reader-purchases", summary: "Signed readers can view their paid read-access purchases; verified status requires the signed wallet to match the chain payer." },
@@ -316,6 +319,7 @@ function publicActivity(db, actor = {}) {
       releases: db.releases.length,
       reviews: db.reviews.length,
       publications: db.publications.length,
+      publication_consents: db.publication_consents.length,
       reader_purchases: db.reader_purchases.length,
       reader_reviews: db.reader_reviews.length,
       order_declines: db.order_declines.length,
@@ -359,6 +363,7 @@ function publicActivity(db, actor = {}) {
     recent_releases: db.releases.slice(-10).reverse().map((release) => publicOrderArtifact(db, release, actor)),
     recent_reviews: db.reviews.slice(-10).reverse().map((review) => publicOrderArtifact(db, review, actor)),
     recent_publications: db.publications.slice(-10).reverse().map((publication) => publicPublication(db, publication, actor)),
+    recent_publication_consents: db.publication_consents.slice(-10).reverse().map((consent) => publicPublicationConsent(db, consent, actor)),
     recent_reader_purchases: db.reader_purchases.slice(-10).reverse().map((purchase) => publicReaderPurchase(db, purchase, actor)),
     recent_reader_reviews: db.reader_reviews.slice(-10).reverse().map((review) => publicReaderReview(db, review, actor)),
     recent_order_acknowledgements: db.order_acknowledgements.slice(-10).reverse().map((ack) => publicOrderArtifact(db, ack, actor)),
@@ -915,6 +920,13 @@ function reconcileOrderTrust(db) {
     }
   }
 
+  for (const consent of db.publication_consents) {
+    const decision = publicationConsentDecision(db, consent.raw || consent, consent.actor);
+    consent.verification_failures = decision.failures;
+    consent.max_reader_price = decision.max_reader_price;
+    consent.status = decision.ok ? "verified_writer_publication_consent" : "blocked_writer_publication_consent";
+  }
+
   for (const publication of db.publications) {
     const order = db.orders.find((candidate) => candidate.id === publication.order_id);
     const delivery = verifiedWriterDeliveryForOrder(db, order, publication.delivery_id);
@@ -926,6 +938,7 @@ function reconcileOrderTrust(db) {
       delivery?.rights_transfer,
       order?.raw?.rights_terms
     ].filter(Boolean).join(" ").toLowerCase();
+    const writerConsent = verifiedWriterPublicationConsent(db, publication);
     const failures = [
       ...(!order ? ["missing_order"] : []),
       ...(!delivery ? ["missing_verified_writer_delivery"] : []),
@@ -933,11 +946,13 @@ function reconcileOrderTrust(db) {
       ...(!released ? ["missing_released_escrow"] : []),
       ...(qualityEvidence?.status === "memoir_quality_evidence_present" ? [] : ["missing_memoir_quality_evidence"]),
       ...(!publication.buyer_consent ? ["missing_buyer_rights_holder_consent"] : []),
-      ...(!publication.writer_consent ? ["missing_writer_consent"] : []),
-      ...(/reader|read.access|ebook|publish|publicat|resale|sell/.test(rightsText) ? [] : ["rights_scope_does_not_allow_reader_sales"]),
+      ...(writerConsent ? [] : ["missing_signed_writer_publication_consent"]),
+      ...(rightsTextAllowsReaderSales(rightsText) ? [] : ["rights_scope_does_not_allow_reader_sales"]),
       ...(Number(publication.price) > 0 ? [] : ["missing_positive_reader_price"]),
       ...(Number(publication.preview_word_count || 0) <= 120 ? [] : ["public_preview_too_long"])
     ];
+    publication.verified_writer_consent_id = writerConsent?.id || null;
+    publication.writer_consent = Boolean(writerConsent);
     publication.rights_verification_failures = failures;
     publication.rights_verified_after_release = Boolean(released);
     publication.status = failures.length ? "blocked_rights_or_release_missing" : "listed";
@@ -1378,11 +1393,78 @@ function publicReview(db, review, actor) {
   };
 }
 
+function rightsTextAllowsReaderSales(text) {
+  return /reader|read.access|ebook|publish|publicat|resale|sell/.test(String(text || "").toLowerCase());
+}
+
+function publicationConsentDecision(db, body, actor) {
+  const publication = body.publication_id ? db.publications.find((candidate) => candidate.id === body.publication_id) : null;
+  const orderId = body.order_id || publication?.order_id;
+  const deliveryId = body.delivery_id || publication?.delivery_id;
+  const order = db.orders.find((candidate) => candidate.id === orderId);
+  const delivery = verifiedWriterDeliveryForOrder(db, order, deliveryId);
+  const priceLimit = Number(body.max_reader_price || body.max_price || 0);
+  const rightsText = [
+    body.rights_scope,
+    body.reader_license_terms,
+    body.consent_terms,
+    publication?.rights_scope,
+    publication?.reader_license_terms,
+    delivery?.rights_transfer,
+    order?.raw?.rights_terms
+  ].filter(Boolean).join(" ").toLowerCase();
+  const failures = [
+    ...(!order ? ["missing_order"] : []),
+    ...(!delivery ? ["missing_verified_writer_delivery"] : []),
+    ...(!actorIsWriter(order, actor) ? ["actor_not_signed_order_writer"] : []),
+    ...(body.reader_sales_consent === true || body.writer_consent === true ? [] : ["missing_reader_sales_consent"]),
+    ...(rightsTextAllowsReaderSales(rightsText) ? [] : ["rights_scope_does_not_allow_reader_sales"]),
+    ...(Number.isFinite(priceLimit) && priceLimit > 0 && publication && Number(publication.price || 0) > priceLimit ? ["publication_price_above_writer_consent_limit"] : [])
+  ];
+  return {
+    ok: failures.length === 0,
+    failures,
+    order,
+    delivery,
+    publication,
+    max_reader_price: Number.isFinite(priceLimit) && priceLimit > 0 ? priceLimit : null
+  };
+}
+
+function verifiedWriterPublicationConsent(db, publication) {
+  if (!publication) return null;
+  const order = db.orders.find((candidate) => candidate.id === publication.order_id);
+  if (!order) return null;
+  return db.publication_consents.slice().reverse().find((consent) => {
+    if (!consent.reader_sales_consent || !actorIsWriter(order, consent.actor)) return false;
+    if (consent.publication_id && consent.publication_id !== publication.id) return false;
+    if (consent.order_id !== publication.order_id || consent.delivery_id !== publication.delivery_id) return false;
+    if (consent.max_reader_price && Number(publication.price || 0) > Number(consent.max_reader_price)) return false;
+    const rightsText = [
+      consent.rights_scope,
+      consent.reader_license_terms,
+      consent.consent_terms,
+      publication.rights_scope,
+      publication.reader_license_terms
+    ].filter(Boolean).join(" ").toLowerCase();
+    return consent.status === "verified_writer_publication_consent" && rightsTextAllowsReaderSales(rightsText);
+  }) || null;
+}
+
 function publicationRightsDecision(db, body, actor) {
   const order = db.orders.find((candidate) => candidate.id === body.order_id);
   const delivery = verifiedWriterDeliveryForOrder(db, order, body.delivery_id);
   const released = releasedEscrowForOrder(db, order);
   const qualityEvidence = delivery ? deliveryQualityEvidence(delivery) : null;
+  const price = Number(body.price || body.reader_price || 0);
+  const writerConsent = verifiedWriterPublicationConsent(db, {
+    id: body.publication_id || null,
+    order_id: body.order_id,
+    delivery_id: body.delivery_id,
+    price,
+    rights_scope: body.rights_scope || null,
+    reader_license_terms: body.reader_license_terms || null
+  });
   const rightsText = [
     body.rights_scope,
     body.reader_license_terms,
@@ -1392,7 +1474,6 @@ function publicationRightsDecision(db, body, actor) {
     order?.raw?.rights_terms
   ].filter(Boolean).join(" ").toLowerCase();
   const previewWords = wordCount(body.public_preview || body.preview || delivery?.excerpt || "");
-  const price = Number(body.price || body.reader_price || 0);
   const failures = [
     ...(!order ? ["missing_order"] : []),
     ...(!delivery ? ["missing_verified_writer_delivery"] : []),
@@ -1400,8 +1481,8 @@ function publicationRightsDecision(db, body, actor) {
     ...(!released ? ["missing_released_escrow"] : []),
     ...(qualityEvidence?.status === "memoir_quality_evidence_present" ? [] : ["missing_memoir_quality_evidence"]),
     ...(body.buyer_consent === true || body.rights_holder_consent === true ? [] : ["missing_buyer_rights_holder_consent"]),
-    ...(body.writer_consent === true ? [] : ["missing_writer_consent"]),
-    ...(/reader|read.access|ebook|publish|publicat|resale|sell/.test(rightsText) ? [] : ["rights_scope_does_not_allow_reader_sales"]),
+    ...(writerConsent ? [] : ["missing_signed_writer_publication_consent"]),
+    ...(rightsTextAllowsReaderSales(rightsText) ? [] : ["rights_scope_does_not_allow_reader_sales"]),
     ...(Number.isFinite(price) && price > 0 ? [] : ["missing_positive_reader_price"]),
     ...(previewWords <= 120 ? [] : ["public_preview_too_long"])
   ];
@@ -1411,6 +1492,7 @@ function publicationRightsDecision(db, body, actor) {
     order,
     delivery,
     released,
+    writer_consent: writerConsent,
     quality_evidence: qualityEvidence,
     price,
     preview_words: previewWords
@@ -1468,6 +1550,7 @@ function publicPublication(db, publication, actor = {}) {
     consent: {
       buyer_consent: publication.buyer_consent,
       writer_consent: publication.writer_consent,
+      verified_writer_consent_id: publication.verified_writer_consent_id || null,
       rights_verified_after_release: Boolean(released)
     },
     craft_evidence: delivery ? {
@@ -1480,6 +1563,30 @@ function publicPublication(db, publication, actor = {}) {
     full_text: canViewFull ? delivery?.draft || delivery?.excerpt || null : undefined,
     read_access: canViewFull ? "verified_access_or_owner" : "purchase_required",
     status: publication.status,
+    rights_verification_failures: publication.status === "listed" ? [] : publication.rights_verification_failures,
+    protected_private_details: !canViewFull
+  };
+}
+
+function publicPublicationConsent(db, consent, actor = {}) {
+  const publication = consent.publication_id ? db.publications.find((candidate) => candidate.id === consent.publication_id) : null;
+  const order = db.orders.find((candidate) => candidate.id === (consent.order_id || publication?.order_id));
+  const canViewFull = order && actorCanViewOrderPrivate(order, actor);
+  return {
+    id: consent.id,
+    at: consent.at,
+    publication_id: consent.publication_id || null,
+    order_id: consent.order_id || publication?.order_id || null,
+    delivery_id: consent.delivery_id || publication?.delivery_id || null,
+    writer_addr: consent.actor?.address || null,
+    reader_sales_consent: consent.reader_sales_consent,
+    max_reader_price: consent.max_reader_price || null,
+    rights_scope: consent.rights_scope,
+    reader_license_terms: consent.reader_license_terms,
+    consent_terms: canViewFull ? consent.consent_terms : consent.consent_terms ? previewText(consent.consent_terms, 160) : null,
+    status: consent.status,
+    verification_failures: consent.verification_failures || [],
+    public_policy: "Reader-sale listings require this signed writer consent plus buyer/rightsholder consent, released escrow, memoir-quality evidence, explicit reader-sale rights, and paid read access.",
     protected_private_details: !canViewFull
   };
 }
@@ -2648,6 +2755,56 @@ async function handle(req, res) {
     });
   }
 
+  if (req.method === "POST" && url.pathname === "/publication-consents") {
+    const decision = publicationConsentDecision(db, body, actor);
+    const item = {
+      id: id("pubconsent"),
+      at: new Date().toISOString(),
+      actor,
+      publication_id: body.publication_id || null,
+      order_id: body.order_id || decision.publication?.order_id || null,
+      delivery_id: body.delivery_id || decision.publication?.delivery_id || null,
+      reader_sales_consent: body.reader_sales_consent === true || body.writer_consent === true,
+      max_reader_price: decision.max_reader_price,
+      rights_scope: body.rights_scope || decision.publication?.rights_scope || null,
+      reader_license_terms: body.reader_license_terms || decision.publication?.reader_license_terms || "personal_read_access_only_no_reuse_no_training_no_redistribution",
+      consent_terms: body.consent_terms || body.writer_consent_evidence || null,
+      verification_failures: decision.failures,
+      raw: body,
+      status: decision.ok ? "verified_writer_publication_consent" : "blocked_writer_publication_consent"
+    };
+    db.publication_consents.push(item);
+    reconcileOrderTrust(db);
+    writeDb(db);
+    return send(res, 201, {
+      ok: item.status === "verified_writer_publication_consent",
+      publication_consent: publicPublicationConsent(db, item, actor),
+      publication: decision.publication ? publicPublication(db, decision.publication, actor) : null,
+      ui: ui(
+        item.status === "verified_writer_publication_consent" ? "Writer consent verified" : "Writer consent blocked",
+        item.status === "verified_writer_publication_consent"
+          ? "This signed writer consent can satisfy the catalog rights gate for the matching publication/order delivery."
+          : "Only the signed order writer can consent to reader sales, and the consent must explicitly allow reader access or publication."
+      )
+    });
+  }
+
+  if (req.method === "GET" && url.pathname === "/publication-consents") {
+    let consents = db.publication_consents.slice();
+    const publicationFilter = url.searchParams.get("publication_id");
+    const orderFilter = url.searchParams.get("order_id");
+    const writerFilter = url.searchParams.get("writer_addr");
+    if (publicationFilter) consents = consents.filter((consent) => consent.publication_id === publicationFilter);
+    if (orderFilter) consents = consents.filter((consent) => consent.order_id === orderFilter);
+    if (writerFilter === "me") consents = actor.signed ? consents.filter((consent) => isSameAddress(consent.actor?.address, actor.address)) : [];
+    else if (writerFilter) consents = consents.filter((consent) => isSameAddress(consent.actor?.address, writerFilter));
+    writeDb(db);
+    return send(res, 200, {
+      publication_consents: consents.map((consent) => publicPublicationConsent(db, consent, actor)),
+      ui: ui("Publication consents", "Signed writer consent is required before any released memoir delivery can be sold to readers.")
+    });
+  }
+
   if (req.method === "POST" && url.pathname === "/publications") {
     const decision = publicationRightsDecision(db, body, actor);
     const order = decision.order;
@@ -2675,7 +2832,8 @@ async function handle(req, res) {
       rights_holder_addr: body.rights_holder_addr || order?.actor?.address || null,
       writer_addr: order?.payee_addr || null,
       buyer_consent: body.buyer_consent === true || body.rights_holder_consent === true,
-      writer_consent: body.writer_consent === true,
+      writer_consent: Boolean(decision.writer_consent),
+      verified_writer_consent_id: decision.writer_consent?.id || null,
       writer_consent_evidence: body.writer_consent_evidence || null,
       rights_scope: body.rights_scope || null,
       reader_license_terms: body.reader_license_terms || "personal_read_access_only_no_reuse_no_training_no_redistribution",
@@ -2697,7 +2855,7 @@ async function handle(req, res) {
         item.status === "listed" ? "Publication listed" : "Publication blocked",
         item.status === "listed"
           ? "Catalog shows only the rights-scoped preview. Readers need verified payment for full access."
-          : "Reader sales require released paid delivery, buyer consent, writer consent, explicit reader-sale rights, a positive price, and a short preview."
+          : "Reader sales require released paid delivery, buyer consent, signed writer consent, explicit reader-sale rights, a positive price, and a short preview."
       )
     });
   }
