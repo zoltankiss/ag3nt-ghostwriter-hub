@@ -425,16 +425,56 @@ function briefSampleRisk(body = {}) {
   };
 }
 
+function briefPrivacyAssessment(body = {}) {
+  const combined = [
+    body.story,
+    body.memoir,
+    body.want,
+    body.requirements,
+    body.privacy,
+    body.private_details_note,
+    body.withheld_details,
+    body.sensitive_details,
+    body.proposal_private_notes
+  ].filter(Boolean).join(" ").toLowerCase();
+  const flags = [];
+  if (/withheld|private thread|after escrow|after funding|after selecting|selected writer|until hired|private_until_hired|confidential/.test(combined)) {
+    flags.push("withheld_sensitive_details");
+  }
+  if (/daughter|son|spouse|wife|husband|divorce|medical|client|company|sale|business|immigrat|family/.test(combined)) {
+    flags.push("memoir_identity_risk");
+  }
+  if (/quote|dialogue|names?|office object|object details|private names|family details/.test(combined)) {
+    flags.push("contains_or_references_private_anchors");
+  }
+  return {
+    flags: [...new Set(flags)],
+    public_summary_policy: flags.length
+      ? "Public brief text should stay thematic and short; concrete dialogue, names, family details, and object anchors belong in private proposal/order surfaces."
+      : "No obvious memoir privacy flags detected, but keep identifying details out of public samples until escrow is verified.",
+    protected_private_details: flags.length > 0
+  };
+}
+
+function sourceReferencesCopiedSample(provenance) {
+  const text = String(provenance || "").toLowerCase();
+  return /cop(y|ied|ying)|repost|scrape|public preview|public_preview|sample_[0-9a-f]+|not original|from another writer/.test(text);
+}
+
 function sampleDuplicateRisk(db, actor, text, provenance) {
   const fingerprint = textFingerprint(text);
-  if (!fingerprint) return { fingerprint: null, duplicate_of_sample_id: null, flags: [] };
+  const flags = [];
+  if (!fingerprint) {
+    if (sourceReferencesCopiedSample(provenance)) flags.push("provenance_admits_copied_public_preview");
+    return { fingerprint: null, duplicate_of_sample_id: null, flags };
+  }
   const duplicate = db.samples.find((sample) =>
     sample.text_fingerprint === fingerprint ||
     (sample.excerpt && textFingerprint(sample.excerpt) === fingerprint)
   );
-  const flags = [];
   if (duplicate && !isSameAddress(duplicate.actor?.address, actor?.address)) flags.push("duplicate_public_sample_text");
   if (duplicate && !provenance) flags.push("missing_provenance_for_duplicate_text");
+  if (sourceReferencesCopiedSample(provenance)) flags.push("provenance_admits_copied_public_preview");
   return {
     fingerprint,
     duplicate_of_sample_id: duplicate?.id || null,
@@ -706,6 +746,23 @@ function orderOperationalState(db, order) {
 }
 
 function reconcileOrderTrust(db) {
+  for (const sample of db.samples) {
+    if (sourceReferencesCopiedSample(sample.provenance)) {
+      sample.status = "blocked_copied_or_duplicate_public_preview";
+      sample.risk_flags = Array.from(new Set([...(sample.risk_flags || []), "provenance_admits_copied_public_preview"]));
+    }
+  }
+
+  for (const offer of db.offers) {
+    if (offer.source === "sample") {
+      const sample = db.samples.find((candidate) => candidate.id === offer.source_id);
+      if (sample && sample.status !== "submitted") {
+        offer.status = "blocked_copied_sample";
+        offer.risk_flags = Array.from(new Set([...(offer.risk_flags || []), "source_sample_blocked"]));
+      }
+    }
+  }
+
   for (const order of db.orders) {
     const trust = orderTrustState(db, order);
     order.trust = {
@@ -856,22 +913,37 @@ function publicProfile(profile) {
 function publicBrief(db, brief, actor) {
   const canViewFull = actor?.signed && isSameAddress(actor.address, brief.actor?.address);
   const sample_risk = brief.sample_risk || briefSampleRisk(brief.raw || brief);
+  const privacy = brief.privacy_assessment || briefPrivacyAssessment(brief.raw || brief);
   return {
     ...brief,
     story: canViewFull ? brief.story : previewText(brief.story, 260),
     raw: canViewFull ? brief.raw : undefined,
     funding_state: briefFundingState(db, brief),
     sample_risk,
+    privacy_assessment: privacy,
     public_sample_policy: {
       max_unfunded_preview_words: sample_risk.max_public_preview_words_before_escrow,
       full_drafts_after_verified_escrow: true,
       no_reuse_until_paid_release: true
     },
-    protected_private_details: canViewFull ? false : true
+    protected_private_details: privacy.protected_private_details || !canViewFull
   };
 }
 
 function publicSample(sample) {
+  if (sample.status && sample.status !== "submitted") {
+    return {
+      id: sample.id,
+      at: sample.at,
+      actor: sample.actor,
+      brief_id: sample.brief_id,
+      status: sample.status,
+      duplicate_of_sample_id: sample.duplicate_of_sample_id,
+      risk_flags: sample.risk_flags || [],
+      blocked_from_public_supply: true,
+      protected_private_details: true
+    };
+  }
   return {
     ...sample,
     excerpt: previewText(sample.excerpt, 280),
@@ -1352,6 +1424,7 @@ async function handle(req, res) {
 
   if (req.method === "POST" && url.pathname === "/briefs") {
     const sampleRisk = briefSampleRisk(body);
+    const privacyAssessment = briefPrivacyAssessment(body);
     const item = {
       id: id("brief"),
       at: new Date().toISOString(),
@@ -1363,6 +1436,7 @@ async function handle(req, res) {
       deadline: body.deadline || null,
       privacy: body.privacy || "private_until_hired",
       sample_risk: sampleRisk,
+      privacy_assessment: privacyAssessment,
       funding_state_hint: "unfunded_open_brief",
       raw: body,
       status: "open"
@@ -1390,9 +1464,11 @@ async function handle(req, res) {
         { method: "POST", path: "/feedback", label: "Request missing buyer workflow" }
       ],
       ui: ui(
-        sampleRisk.flags.length ? "Brief posted with unpaid sample warning" : "Brief posted",
+        sampleRisk.flags.length ? "Brief posted with unpaid sample warning" : privacyAssessment.flags.length ? "Brief posted with privacy warning" : "Brief posted",
         sampleRisk.flags.length
           ? sampleRisk.guidance
+          : privacyAssessment.flags.length
+            ? privacyAssessment.public_summary_policy
           : "Writers can submit a short protected preview, then move full prose into a funded order."
       )
     });
@@ -1430,7 +1506,11 @@ async function handle(req, res) {
       ...(!linkedBriefFunded && wordCount(fullText) > 500 ? ["long_unfunded_audition_text_withheld"] : []),
       ...(!provenance ? ["missing_sample_provenance"] : [])
     ];
-    const blockedDuplicate = duplicateRisk.flags.includes("duplicate_public_sample_text") && duplicateRisk.flags.includes("missing_provenance_for_duplicate_text");
+    const copiedPublicPreview = duplicateRisk.flags.includes("provenance_admits_copied_public_preview");
+    const blockedDuplicate = (
+      duplicateRisk.flags.includes("duplicate_public_sample_text") &&
+      (duplicateRisk.flags.includes("missing_provenance_for_duplicate_text") || copiedPublicPreview)
+    ) || copiedPublicPreview;
     const item = {
       id: id("sample"),
       at: new Date().toISOString(),
@@ -1453,7 +1533,7 @@ async function handle(req, res) {
       terms: body.terms || null,
       proof: body.proof || null,
       raw: body,
-      status: blockedDuplicate ? "blocked_duplicate_or_missing_provenance" : "submitted"
+      status: blockedDuplicate ? "blocked_copied_or_duplicate_public_preview" : "submitted"
     };
     db.samples.push(item);
     if (item.status === "submitted") {
@@ -1482,7 +1562,7 @@ async function handle(req, res) {
       ui: ui(
         item.status === "submitted" ? "Sample submitted" : "Sample blocked",
         item.status !== "submitted"
-          ? "This sample matches existing public text and needs provenance before it can create a writer offer."
+          ? "Copied or duplicate public preview text cannot create a listed writer sample or offer."
           : protectedMode
           ? "Only the preview is public. Use /proposals for questions and terms before funding."
           : "A buyer can now commit to this writer; full reusable prose belongs in funded delivery."
