@@ -663,7 +663,7 @@ function briefPrivacyAssessment(body = {}) {
     body.proposal_private_notes
   ].filter(Boolean).join(" ").toLowerCase();
   const flags = [];
-  if (/withheld|private thread|after escrow|after funding|after selecting|selected writer|until hired|private_until_hired|confidential/.test(combined)) {
+  if (/withheld|private thread|after escrow|after funding|after selecting|selected writer|until hired|private_until_hired|confidential|\bhigh\b|high.privacy|private|sensitive/.test(combined)) {
     flags.push("withheld_sensitive_details");
   }
   if (/daughter|son|spouse|wife|husband|divorce|medical|client|company|sale|business|immigrat|family/.test(combined)) {
@@ -678,6 +678,42 @@ function briefPrivacyAssessment(body = {}) {
       ? "Public brief text should stay thematic and short; concrete dialogue, names, family details, and object anchors belong in private proposal/order surfaces."
       : "No obvious memoir privacy flags detected, but keep identifying details out of public samples until escrow is verified.",
     protected_private_details: flags.length > 0
+  };
+}
+
+function publicBriefSummary(brief, privacy) {
+  const raw = brief?.raw || {};
+  if (raw.public_summary) return previewText(raw.public_summary, 220);
+  const audience = brief?.audience ? `Audience: ${previewText(brief.audience, 80)}.` : "";
+  const tone = brief?.tone ? ` Tone: ${previewText(brief.tone, 80)}.` : "";
+  if (privacy?.protected_private_details) {
+    return `Private memoir brief. ${audience}${tone}`.replace(/\s+/g, " ").trim();
+  }
+  return previewText(brief?.story, 180);
+}
+
+function buyerPaidHistoryForBrief(db, brief) {
+  const buyerAddr = brief?.actor?.address;
+  const buyerOrders = buyerAddr
+    ? db.orders.filter((order) => isSameAddress(order.actor?.address, buyerAddr))
+    : [];
+  const funded = buyerOrders.filter((order) => verifiedEscrowForOrder(db, order));
+  const released = buyerOrders.filter((order) => releasedEscrowForOrder(db, order));
+  const verifiedReviews = db.reviews.filter((review) => {
+    const order = db.orders.find((candidate) => candidate.id === review.order_id);
+    return order && isSameAddress(order.actor?.address, buyerAddr) && review.status === "verified_paid_review";
+  });
+  return {
+    buyer_signed: Boolean(brief?.actor?.signed),
+    buyer_addr: buyerAddr || null,
+    funded_order_count: funded.length,
+    released_paid_order_count: released.length,
+    verified_paid_review_count: verifiedReviews.length,
+    funded_value: funded.reduce((sum, order) => sum + money(order.amount), 0),
+    escrow_readiness: funded.length ? "buyer_has_verified_funded_history" : "no_verified_funded_history_yet",
+    writer_guidance: funded.length
+      ? "Buyer has verified funded order history; still require order-specific escrow before reusable memoir drafting."
+      : "Treat this as unfunded until a signed order has verified chain escrow."
   };
 }
 
@@ -1478,13 +1514,26 @@ function publicRequest(request, actor = {}) {
 function publicBrief(db, brief, actor) {
   const canViewFull = actor?.signed && isSameAddress(actor.address, brief.actor?.address);
   const sample_risk = brief.sample_risk || briefSampleRisk(brief.raw || brief);
-  const privacy = brief.privacy_assessment || briefPrivacyAssessment(brief.raw || brief);
+  const storedPrivacy = brief.privacy_assessment || {};
+  const latestPrivacy = briefPrivacyAssessment({ ...(brief.raw || {}), ...brief });
+  const privacy = {
+    ...storedPrivacy,
+    flags: [...new Set([...(storedPrivacy.flags || []), ...(latestPrivacy.flags || [])])],
+    public_summary_policy: latestPrivacy.protected_private_details
+      ? latestPrivacy.public_summary_policy
+      : storedPrivacy.public_summary_policy || latestPrivacy.public_summary_policy,
+    protected_private_details: Boolean(storedPrivacy.protected_private_details || latestPrivacy.protected_private_details)
+  };
   const canShowStoryPreview = canViewFull || !privacy.protected_private_details;
+  const funding_state = briefFundingState(db, brief);
+  const public_summary = publicBriefSummary(brief, privacy);
   return {
     ...brief,
     story: canShowStoryPreview ? canViewFull ? brief.story : previewText(brief.story, 180) : "Private memoir brief; full story is visible only to the signed buyer.",
+    public_summary,
     raw: canViewFull ? brief.raw : undefined,
-    funding_state: briefFundingState(db, brief),
+    funding_state,
+    buyer_paid_history: buyerPaidHistoryForBrief(db, brief),
     sample_risk,
     privacy_assessment: privacy,
     public_sample_policy: {
@@ -2468,9 +2517,27 @@ async function handle(req, res) {
   }
 
   if (req.method === "GET" && url.pathname === "/briefs") {
+    const fundingFilter = url.searchParams.get("funding_state") || url.searchParams.get("escrow");
+    let briefs = db.briefs.slice();
+    if (fundingFilter) {
+      briefs = briefs.filter((brief) => {
+        const funding = briefFundingState(db, brief);
+        if (fundingFilter === "funded" || fundingFilter === "escrow-ready") return funding.funded_order_count > 0;
+        if (fundingFilter === "released") return funding.released_order_count > 0;
+        if (fundingFilter === "unfunded" || fundingFilter === "bait") return funding.funded_order_count === 0;
+        return funding.state === fundingFilter;
+      });
+    }
     writeDb(db);
     return send(res, 200, {
-      briefs: db.briefs.map((brief) => publicBrief(db, brief, actor)),
+      briefs: briefs.map((brief) => publicBrief(db, brief, actor)),
+      filters: {
+        funding_state: fundingFilter || null,
+        examples: ["?funding_state=funded", "?funding_state=unfunded", "?funding_state=released"]
+      },
+      writer_signing_guidance: actor.signed
+        ? "Signed writer requests can use wallet-bound dashboard and proposal/order queues."
+        : "Use ag3nt request with your wallet signature for writer-dashboard, proposal ownership, funded order queues, and reputation.",
       ui: ui("Memoir briefs", "Open briefs are not paid work until an order has verified escrow. Keep public samples short.")
     });
   }
