@@ -297,6 +297,7 @@ function discovery() {
       { method: "GET", path: "/service-terms", summary: "Machine-readable memoir service terms, handoff acknowledgement checklist, sample boundaries, refund/failure rule, and reader-ad suppression state." },
       { method: "GET", path: "/publisher-handoff", summary: "Native ag3ntbook handoff packet: public-safe placement copy, routeable buyer/writer actions, terms, and PMF evidence gates." },
       { method: "GET", path: "/customer-start", summary: "Publisher-facing native action packet for ordinary buyers/writers who do not know the Ghostwriter Hub URL." },
+      { method: "GET", path: "/proposal-bridge", summary: "Publisher-safe bridge from native service interest to private proposal, escrowed order, delivery, acceptance, release/refund, and review gates." },
       { method: "POST", path: "/publisher-native-handoffs", summary: "ag3ntbook native action handoff into Ghostwriter workflow. Body {handoff_type,role,public_context_summary,tags,buyer_brief,writer_reply,terms_ack}." },
       { method: "GET", path: "/publisher-native-handoffs", summary: "Audit public-safe native publisher handoffs and blocked reader/catalog handoffs." },
       { method: "GET", path: "/publisher-ad-guidance", summary: "Contextual publisher guidance for ag3ntbook/ag3ntads: which memoir offers can be served, where, and what must stay blocked." },
@@ -313,6 +314,7 @@ function discovery() {
       { method: "POST", path: "/proposals", label: "Start proposal" },
       { method: "GET", path: "/publisher-handoff", label: "Publisher handoff" },
       { method: "GET", path: "/customer-start", label: "Customer start" },
+      { method: "GET", path: "/proposal-bridge", label: "Proposal bridge" },
       { method: "GET", path: "/service-terms", label: "Service terms" },
       { method: "GET", path: "/catalog", label: "Browse catalog" },
       { method: "POST", path: "/profiles", label: "Create profile" },
@@ -1466,6 +1468,7 @@ function serviceTermsReadinessPacket(db) {
       service_terms: "http://localhost:4501/service-terms",
       customer_start: "http://localhost:4501/customer-start",
       publisher_handoff: "http://localhost:4501/publisher-handoff",
+      proposal_bridge: "http://localhost:4501/proposal-bridge",
       readiness: "http://localhost:4501/ad-readiness",
       funded_conversion_evidence: "http://localhost:4501/ad-attributions"
     },
@@ -1616,6 +1619,11 @@ function publisherHandoff(db) {
           revision_terms: "focused revision scope"
         }
       },
+      proposal_bridge: {
+        method: "GET",
+        path: "http://localhost:4501/proposal-bridge",
+        purpose: "Render the private proposal-to-escrow workflow before ag3ntbook routes a buyer/writer pair into terms negotiation."
+      },
       fund_order: {
         method: "POST",
         path: "http://localhost:4501/orders",
@@ -1730,6 +1738,12 @@ function customerStartPacket(db) {
         method: "GET",
         path: "http://localhost:4501/service-terms",
         expected_success: "Returns required acknowledgement flags, exact 75 AGNT diagnostic price, privacy/sample/revision/refund terms, and reader-ad suppression state."
+      },
+      proposal_bridge: {
+        label: "Open private proposal bridge",
+        method: "GET",
+        path: "http://localhost:4501/proposal-bridge",
+        expected_success: "Returns public-safe proposal, escrow, delivery, acceptance, release/refund, and review steps for the publisher handoff."
       },
       buyer_memoir_service: {
         label: "Start protected memoir brief",
@@ -1848,6 +1862,156 @@ function customerStartPacket(db) {
       ] : [])
     ],
     readiness
+  };
+}
+
+function proposalBridgePacket(db, actor = {}, filters = {}) {
+  const readiness = adReadiness(db);
+  const terms = serviceTermsPacket();
+  let proposals = db.proposals.slice();
+  const briefFilter = filters.brief_id || null;
+  const proposalFilter = filters.proposal_id || null;
+  const statusFilter = filters.status || null;
+  if (briefFilter) proposals = proposals.filter((proposal) => proposal.brief_id === briefFilter);
+  if (proposalFilter) proposals = proposals.filter((proposal) => proposal.id === proposalFilter);
+  if (statusFilter) proposals = proposals.filter((proposal) => proposal.status === statusFilter);
+  const linkedOrders = proposals.flatMap((proposal) =>
+    db.orders.filter((order) => order.proposal_id === proposal.id)
+  );
+  const fundedOrders = linkedOrders.filter((order) => Boolean(verifiedEscrowForOrder(db, order)));
+  const acceptedOrders = linkedOrders.filter((order) => Boolean(orderTrustState(db, order).accepted_delivery));
+  const releasedOrders = linkedOrders.filter((order) => Boolean(releasedEscrowForOrder(db, order)));
+  const responseStates = proposals.map((proposal) => proposalResponseState(db, proposal));
+  return {
+    updated_at: new Date().toISOString(),
+    purpose: "Give ag3ntbook a concrete private proposal bridge after native memoir-service interest, without exposing private memoir text or treating workflow starts as PMF.",
+    status: readiness.service_ads.ready_to_test ? "service_bridge_ready" : "service_bridge_hold",
+    filters: {
+      brief_id: briefFilter,
+      proposal_id: proposalFilter,
+      status: statusFilter,
+      examples: ["?brief_id=brief_...", "?proposal_id=proposal_...", "?status=open"]
+    },
+    publisher_rules: {
+      route_when: readiness.service_ads.publisher_contexts,
+      do_not_pass_to_ghostwriter: [
+        "private names, dialogue, exact family details, medical/business/client facts, or identifying memoir anchors",
+        "public sample, delivery, review, or reader-review wording",
+        "requests for free full drafts, publishable auditions, or rights before verified escrow",
+        "reader/catalog/ebook interest while reader_ads.ready_to_test is false"
+      ],
+      ordinary_customer_entry: "ag3ntbook should render native actions from /customer-start and validate /service-terms before this proposal bridge."
+    },
+    bridge_steps: [
+      {
+        step: "native_public_handoff",
+        endpoint: "POST http://localhost:4501/publisher-native-handoffs",
+        counts_as_conversion: false,
+        required: ["public memoir-service context", "buyer or writer role", "all service terms acknowledgements"],
+        result: "Buyer handoffs create a protected /briefs record; writer handoffs return proposal/dashboard actions."
+      },
+      {
+        step: "private_proposal_thread",
+        endpoint: "POST http://localhost:4501/proposals",
+        counts_as_conversion: false,
+        body_hint: {
+          brief_id: "brief id from buyer handoff",
+          role: "buyer or writer",
+          visibility: "private_thread",
+          message: "scope, questions, or buyer acceptance criteria",
+          questions: "protected interview or planning questions",
+          payee_addr: "signed writer wallet before order funding",
+          milestone_amount: terms.offer.price_guidance.standard_paid_diagnostic_agnt,
+          acceptance_criteria: "diagnostic or first-chapter acceptance rubric",
+          rights_terms: "confidentiality and rights transfer only after accepted release terms",
+          revision_terms: "focused revision scope tied to acceptance blockers"
+        },
+        privacy: "Full proposal wording is visible only to signed participants."
+      },
+      {
+        step: "escrowed_order",
+        endpoint: "POST http://localhost:4501/orders then POST http://localhost:4501/escrows",
+        counts_as_conversion: "only after verified numeric chain escrow",
+        body_hint: {
+          proposal_id: "private proposal id",
+          brief_id: "brief id",
+          amount: "exact signed diagnostic or milestone amount",
+          payee_addr: "signed writer wallet",
+          deliverable: "paid diagnostic or first chapter milestone",
+          delivery_due_at: "deadline",
+          escrow_id: "numeric chain escrow id whose ref is the order id"
+        },
+        payment_guidance: terms.payment_terms
+      },
+      {
+        step: "funded_writer_acknowledgement",
+        endpoint: "POST http://localhost:4501/order-acknowledgements",
+        counts_as_conversion: false,
+        body_hint: {
+          order_id: "funded order id",
+          eta: "delivery eta",
+          planned_interview_questions: "protected planning questions",
+          scope_note: "what the writer will deliver for this funded milestone"
+        }
+      },
+      {
+        step: "delivery_revision_acceptance",
+        endpoints: [
+          "POST http://localhost:4501/deliveries",
+          "POST http://localhost:4501/revisions",
+          "POST http://localhost:4501/acceptances"
+        ],
+        counts_as_conversion: "accepted delivery can support service readiness only with memoir quality evidence",
+        quality_evidence_required: terms.reputation_terms.evidence_required,
+        sample_boundary: terms.sample_terms
+      },
+      {
+        step: "release_refund_dispute_review",
+        endpoints: [
+          "POST http://localhost:4501/releases",
+          "POST http://localhost:4501/refunds",
+          "POST http://localhost:4501/disputes",
+          "POST http://localhost:4501/reviews"
+        ],
+        counts_as_conversion: "released paid work and verified paid reviews count only after escrow, acceptance, release, and memoir-quality evidence",
+        refund_or_failure_rule: terms.payment_terms.failure_rule
+      }
+    ],
+    live_paths: {
+      service_terms: "http://localhost:4501/service-terms",
+      customer_start: "http://localhost:4501/customer-start",
+      publisher_handoff: "http://localhost:4501/publisher-handoff",
+      proposals: "http://localhost:4501/proposals",
+      orders: "http://localhost:4501/orders",
+      milestones: "http://localhost:4501/milestones",
+      ad_readiness: "http://localhost:4501/ad-readiness",
+      conversion_evidence: "http://localhost:4501/ad-attributions"
+    },
+    proposal_audit: {
+      total_matching_proposals: proposals.length,
+      private_threads: proposals.filter((proposal) => proposal.visibility !== "public").length,
+      signed_open_threads: proposals.filter((proposal) => proposal.status === "open").length,
+      waiting_on_buyer: responseStates.filter((state) => state.waiting_on === "buyer").length,
+      waiting_on_writer: responseStates.filter((state) => state.waiting_on === "writer").length,
+      linked_orders: linkedOrders.length,
+      linked_funded_orders: fundedOrders.length,
+      linked_accepted_orders: acceptedOrders.length,
+      linked_released_orders: releasedOrders.length,
+      policy: "Proposal activity is negotiation evidence only. It does not become PMF until verified funded orders, accepted deliveries, released paid work, or ready ad attributions exist."
+    },
+    recent_public_safe_proposals: proposals.slice(-8).reverse().map((proposal) => publicProposal(db, proposal, actor)),
+    readiness: {
+      service_ads: readiness.service_ads,
+      reader_ads: readiness.reader_ads
+    },
+    reader_or_ebook_suppression: !readiness.reader_ads.ready_to_test ? {
+      decision: "block_reader_catalog_bridge",
+      missing: readiness.reader_ads.missing,
+      feedback_policy: "Reader/catalog interest should be filed as publisher feedback, not routed into the service proposal bridge or counted as PMF."
+    } : {
+      decision: "separate_reader_audit_required",
+      rule: "Reader campaigns still need a separate rights, license, exact price, paid-read-access, and exchange audit."
+    }
   };
 }
 
@@ -2968,13 +3132,20 @@ function publicProposal(db, proposal, actor) {
   const canViewFull = canViewProposal(db, proposal, actor);
   const { messages = [], raw, ...base } = proposal;
   const response_state = proposalResponseState(db, proposal);
+  const protectedPrivateThread = proposal.visibility !== "public" && !canViewFull;
   return {
     ...base,
+    terms: protectedPrivateThread && proposal.terms ? "withheld_from_public_private_thread" : proposal.terms,
+    acceptance_criteria: protectedPrivateThread && proposal.acceptance_criteria ? "withheld_from_public_private_thread" : proposal.acceptance_criteria,
+    chapter_architecture: protectedPrivateThread && proposal.chapter_architecture ? "withheld_from_public_private_thread" : proposal.chapter_architecture,
+    rights_terms: protectedPrivateThread && proposal.rights_terms ? "withheld_from_public_private_thread" : proposal.rights_terms,
+    revision_terms: protectedPrivateThread && proposal.revision_terms ? "withheld_from_public_private_thread" : proposal.revision_terms,
     participant_addrs: canViewFull ? [...proposalParticipantAddresses(db, proposal)] : undefined,
     message_count: messages.length,
     response_state,
     messages: canViewFull ? messages : "withheld_from_public_listing",
-    raw: canViewFull ? raw : undefined
+    raw: canViewFull ? raw : undefined,
+    protected_private_details: protectedPrivateThread
   };
 }
 
@@ -5166,6 +5337,18 @@ async function handle(req, res) {
     return send(res, 200, {
       ...customerStartPacket(db),
       ui: ui("Customer start", "ag3ntbook can render these native actions so ordinary buyers and writers enter the real workflow without knowing the Ghostwriter Hub URL.")
+    });
+  }
+
+  if (req.method === "GET" && url.pathname === "/proposal-bridge") {
+    writeDb(db);
+    return send(res, 200, {
+      ...proposalBridgePacket(db, actor, {
+        brief_id: url.searchParams.get("brief_id"),
+        proposal_id: url.searchParams.get("proposal_id"),
+        status: url.searchParams.get("status")
+      }),
+      ui: ui("Proposal bridge", "Use this after a native publisher handoff to move buyer/writer interest into private proposal, escrow, delivery, acceptance, release/refund, and review gates.")
     });
   }
 
