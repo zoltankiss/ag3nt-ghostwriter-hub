@@ -269,8 +269,8 @@ function discovery() {
       { method: "GET", path: "/reviews", summary: "Browse paid/released reputation without private memoir details. Filters: ?status=verified_paid_review&writer_addr=...&buyer_addr=..." },
       { method: "POST", path: "/publications", summary: "Rights holder lists released memoir material for reader access. Body {order_id,delivery_id,title,public_preview,price,buyer_consent,writer_consent,rights_scope,reader_license_terms}." },
       { method: "GET", path: "/catalog", summary: "Browse rights-cleared memoir previews. Public previews are short and non-reusable." },
-      { method: "POST", path: "/reader-purchases", summary: "Reader buys access to a listed memoir publication. Body {publication_id,escrow_id,amount,payer_addr,payee_addr,ad_campaign_id}." },
-      { method: "GET", path: "/reader-purchases", summary: "Signed readers can view their paid read-access purchases." },
+      { method: "POST", path: "/reader-purchases", summary: "Signed chain payer buys access to a listed memoir publication. Body {publication_id,escrow_id,amount,payer_addr,payee_addr,ad_campaign_id}." },
+      { method: "GET", path: "/reader-purchases", summary: "Signed readers can view their paid read-access purchases; verified status requires the signed wallet to match the chain payer." },
       { method: "GET", path: "/catalog/:id/read", summary: "Signed readers with verified payment can read the full licensed memoir material." },
       { method: "POST", path: "/reader-reviews", summary: "Verified reader review after paid read access. Body {publication_id,reader_purchase_id,rating,message,would_buy_more}." },
       { method: "GET", path: "/reader-reviews", summary: "Browse verified post-purchase reader reviews without exposing full memoir text." },
@@ -947,6 +947,13 @@ function reconcileOrderTrust(db) {
     const publication = db.publications.find((candidate) => candidate.id === purchase.publication_id);
     const status = String(purchase.chain_escrow?.status || purchase.status || "").toLowerCase();
     const fundedLike = ["locked", "submitted", "released"].includes(status);
+    const actorFailures = readerPurchaseActorFailures(purchase, purchase.chain_escrow, purchase.actor);
+    purchase.verification_failures = Array.from(new Set([
+      ...(purchase.verification_failures || []).filter((failure) =>
+        !["reader_payment_claim_not_signed", "missing_signed_reader_wallet", "signed_reader_not_chain_payer"].includes(failure)
+      ),
+      ...actorFailures
+    ]));
     purchase.status = publication?.status === "listed" && purchase.chain_escrow && fundedLike && !purchase.verification_failures?.length
       ? "verified_paid_read_access"
       : "awaiting_verified_reader_payment";
@@ -1041,7 +1048,7 @@ function recordAdAttribution(db, order, body, actor) {
 
 function recordReaderAdAttribution(db, purchase, publication, body) {
   const campaignId = body.ad_campaign_id || body.campaign_id || body.ag3ntads_campaign_id || null;
-  if (!campaignId || !purchase?.actor?.address || purchase.status !== "verified_paid_read_access") return null;
+  if (!campaignId || !purchase?.actor?.signed || !purchase?.actor?.address || purchase.status !== "verified_paid_read_access") return null;
   const existing = db.ad_attributions.find((attribution) =>
     attribution.reader_purchase_id === purchase.id &&
     String(attribution.campaign_id) === String(campaignId)
@@ -1495,6 +1502,15 @@ function readerPurchaseMatchesPublication(chainEscrow, publication, body, actor)
   return { ok: failures.length === 0, failures };
 }
 
+function readerPurchaseActorFailures(purchaseOrBody, chainEscrow, actor) {
+  const payer = String(chainEscrow?.payer || purchaseOrBody?.payer_addr || "");
+  const failures = [];
+  if (!actor?.signed) failures.push("reader_payment_claim_not_signed");
+  if (!actor?.address) failures.push("missing_signed_reader_wallet");
+  if (payer && actor?.address && payer !== actor.address) failures.push("signed_reader_not_chain_payer");
+  return failures;
+}
+
 function verifiedReaderPurchaseForPublication(db, publication, actor = {}) {
   if (!publication || !actor?.signed || !actor.address) return null;
   return db.reader_purchases.slice().reverse().find((purchase) =>
@@ -1520,6 +1536,7 @@ function publicReaderPurchase(db, purchase, actor = {}) {
     chain_escrow: canViewFull ? chain_escrow : chain_escrow ? { id: chain_escrow.id, amount: chain_escrow.amount, status: chain_escrow.status, ref: chain_escrow.ref } : undefined,
     raw: canViewFull ? raw : undefined,
     read_path: purchase.status === "verified_paid_read_access" && canViewFull ? `/catalog/${purchase.publication_id}/read` : null,
+    payment_claim_policy: "Read access, reader revenue, reader reviews, and ad attribution count only when the chain payer signs the purchase claim.",
     protected_private_details: !canViewFull
   };
 }
@@ -2743,7 +2760,9 @@ async function handle(req, res) {
     const chainEscrow = await getChainEscrow(body.escrow_id || body.chain_escrow_id);
     const chainStatus = chainEscrow && String(chainEscrow.status || "").toLowerCase();
     const match = readerPurchaseMatchesPublication(chainEscrow, publication, body, actor);
-    const verified = Boolean(publication?.status === "listed" && chainEscrow && ["locked", "submitted", "released"].includes(chainStatus) && match.ok);
+    const actorFailures = readerPurchaseActorFailures(body, chainEscrow, actor);
+    const verificationFailures = [...match.failures, ...actorFailures];
+    const verified = Boolean(publication?.status === "listed" && chainEscrow && ["locked", "submitted", "released"].includes(chainStatus) && !verificationFailures.length);
     const amount = Number(body.amount || publication?.price || 0);
     const platformFee = verified ? Math.max(0, Math.round(amount * 0.15 * 100) / 100) : 0;
     const item = {
@@ -2759,7 +2778,7 @@ async function handle(req, res) {
       rights_holder_earnings: verified ? Math.max(0, Math.round((amount - platformFee) * 100) / 100) : 0,
       proof: body.proof || null,
       chain_escrow: chainEscrow,
-      verification_failures: match.failures,
+      verification_failures: verificationFailures,
       raw: body,
       status: verified ? "verified_paid_read_access" : "awaiting_verified_reader_payment"
     };
@@ -2772,7 +2791,7 @@ async function handle(req, res) {
       publication: publication ? publicPublication(db, publication, actor) : null,
       ui: ui(
         verified ? "Read access verified" : "Read access not verified",
-        verified ? `Full text is available at /catalog/${publication.id}/read.` : "Reader access requires a listed publication and a funded chain escrow whose ref is the publication id."
+        verified ? `Full text is available at /catalog/${publication.id}/read.` : "Reader access requires a listed publication and a funded chain escrow whose ref is the publication id, signed by the chain payer."
       )
     });
   }
@@ -2786,7 +2805,7 @@ async function handle(req, res) {
     writeDb(db);
     return send(res, 200, {
       reader_purchases: purchases.map((purchase) => publicReaderPurchase(db, purchase, actor)),
-      ui: ui("Reader purchases", "Verified purchases unlock read access and reader review eligibility.")
+      ui: ui("Reader purchases", "Verified purchases unlock read access and reader review eligibility only when the signed reader wallet matches the chain payer.")
     });
   }
 
