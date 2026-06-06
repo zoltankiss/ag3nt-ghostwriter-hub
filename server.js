@@ -333,6 +333,7 @@ function publicActivity(db, actor = {}) {
       verified_reviews: db.reviews.filter((review) => review.status === "verified_paid_review").length,
       paid_reader_purchases: db.reader_purchases.filter((purchase) => purchase.status === "verified_paid_read_access").length,
       verified_reader_reviews: db.reader_reviews.filter((review) => review.status === "verified_reader_review").length,
+      protected_paid_reader_reviews: db.reader_reviews.filter((review) => review.status === "verified_reader_review_private_quote_blocked").length,
       reader_revenue: db.reader_purchases.reduce((sum, purchase) => sum + (purchase.status === "verified_paid_read_access" ? Number(purchase.amount || 0) : 0), 0),
       platform_fees: [
         ...db.orders.map((order) => orderTrustState(db, order).released_escrow ? Number(order.platform_fee || 0) : 0),
@@ -341,18 +342,18 @@ function publicActivity(db, actor = {}) {
       ad_click_to_funded_order: db.ad_attributions.filter((attribution) => attribution.status === "ready_to_attest").length,
       ad_click_to_funded_read: db.ad_attributions.filter((attribution) => attribution.status === "ready_to_attest_reader_purchase").length
     },
-    recent_feedback: db.feedback.slice(-10).reverse(),
+    recent_feedback: db.feedback.slice(-10).reverse().map((feedback) => publicFeedback(feedback, actor)),
     recent_briefs: db.briefs.slice(-10).reverse().map((brief) => publicBrief(db, brief, actor)),
     recent_samples: db.samples.slice(-10).reverse().map(publicSample),
     recent_proposals: db.proposals.slice(-10).reverse().map((proposal) => publicProposal(db, proposal, actor)),
     recent_profiles: db.profiles.slice(-10).reverse().map(publicProfile),
     recent_escrows: db.escrows.slice(-10).reverse().map((escrow) => publicEscrow(db, escrow, actor)),
-    recent_intents: db.intents.slice(-10).reverse(),
-    recent_offers: db.offers.slice(-10).reverse(),
+    recent_intents: db.intents.slice(-10).reverse().map((intent) => publicIntent(intent, actor)),
+    recent_offers: db.offers.slice(-10).reverse().map((offer) => publicOffer(offer, actor)),
     recent_orders: db.orders.slice(-10).reverse().map((order) => publicOrderSummary(db, order, actor)),
     recent_deliveries: db.deliveries.slice(-10).reverse().map((delivery) => publicDelivery(db, delivery, db.orders.find((order) => order.id === delivery.order_id), actor)),
     recent_revisions: db.revisions.slice(-10).reverse().map((revision) => publicRevision(db, revision, actor)),
-    recent_disputes: db.disputes.slice(-10).reverse(),
+    recent_disputes: db.disputes.slice(-10).reverse().map((dispute) => publicOrderArtifact(db, dispute, actor)),
     recent_acceptances: db.acceptances.slice(-10).reverse().map((acceptance) => publicOrderArtifact(db, acceptance, actor)),
     recent_refunds: db.refunds.slice(-10).reverse().map((refund) => publicOrderArtifact(db, refund, actor)),
     recent_releases: db.releases.slice(-10).reverse().map((release) => publicOrderArtifact(db, release, actor)),
@@ -362,7 +363,7 @@ function publicActivity(db, actor = {}) {
     recent_reader_reviews: db.reader_reviews.slice(-10).reverse().map((review) => publicReaderReview(db, review, actor)),
     recent_order_acknowledgements: db.order_acknowledgements.slice(-10).reverse().map((ack) => publicOrderArtifact(db, ack, actor)),
     recent_ad_attributions: db.ad_attributions.slice(-10).reverse(),
-    recent_requests: db.requests.slice(-20).reverse()
+    recent_requests: db.requests.slice(-20).reverse().map((request) => publicRequest(request, actor))
   };
 }
 
@@ -918,6 +919,7 @@ function reconcileOrderTrust(db) {
     const order = db.orders.find((candidate) => candidate.id === publication.order_id);
     const delivery = verifiedWriterDeliveryForOrder(db, order, publication.delivery_id);
     const released = releasedEscrowForOrder(db, order);
+    const qualityEvidence = delivery ? deliveryQualityEvidence(delivery) : null;
     const rightsText = [
       publication.rights_scope,
       publication.reader_license_terms,
@@ -927,7 +929,9 @@ function reconcileOrderTrust(db) {
     const failures = [
       ...(!order ? ["missing_order"] : []),
       ...(!delivery ? ["missing_verified_writer_delivery"] : []),
+      ...(order && !actorIsBuyer(order, publication.actor) ? ["publication_actor_not_verified_rights_holder"] : []),
       ...(!released ? ["missing_released_escrow"] : []),
+      ...(qualityEvidence?.status === "memoir_quality_evidence_present" ? [] : ["missing_memoir_quality_evidence"]),
       ...(!publication.buyer_consent ? ["missing_buyer_rights_holder_consent"] : []),
       ...(!publication.writer_consent ? ["missing_writer_consent"] : []),
       ...(/reader|read.access|ebook|publish|publicat|resale|sell/.test(rightsText) ? [] : ["rights_scope_does_not_allow_reader_sales"]),
@@ -935,6 +939,7 @@ function reconcileOrderTrust(db) {
       ...(Number(publication.preview_word_count || 0) <= 120 ? [] : ["public_preview_too_long"])
     ];
     publication.rights_verification_failures = failures;
+    publication.rights_verified_after_release = Boolean(released);
     publication.status = failures.length ? "blocked_rights_or_release_missing" : "listed";
   }
 
@@ -949,12 +954,14 @@ function reconcileOrderTrust(db) {
 
   for (const review of db.reader_reviews) {
     const purchase = db.reader_purchases.find((candidate) => candidate.id === review.reader_purchase_id);
-    review.status = purchase &&
+    review.leak_risk = readerReviewLeakRisk(review.message);
+    const verifiedPurchase = purchase &&
       purchase.publication_id === review.publication_id &&
       purchase.status === "verified_paid_read_access" &&
       review.actor?.signed &&
-      isSameAddress(review.actor.address, purchase.actor?.address)
-      ? "verified_reader_review"
+      isSameAddress(review.actor.address, purchase.actor?.address);
+    review.status = verifiedPurchase
+      ? review.leak_risk.public_safe ? "verified_reader_review" : "verified_reader_review_private_quote_blocked"
       : "unverified_reader_review";
   }
 
@@ -1065,13 +1072,66 @@ function publicProfile(profile) {
   return safe;
 }
 
+function publicFeedback(feedback, actor = {}) {
+  const canViewFull = actor?.signed && isSameAddress(actor.address, feedback.actor?.address);
+  const { raw, ...safe } = feedback;
+  return {
+    ...safe,
+    message: canViewFull ? feedback.message : "Feedback wording withheld from public activity because it may include private memoir, security, or payment details.",
+    raw: canViewFull ? raw : undefined,
+    protected_private_details: !canViewFull
+  };
+}
+
+function publicIntent(intent, actor = {}) {
+  const canViewFull = actor?.signed && isSameAddress(actor.address, intent.actor?.address);
+  const { raw, ...safe } = intent;
+  return {
+    ...safe,
+    want: canViewFull ? intent.want : intent.source === "brief" ? "Private memoir buyer intent; see /briefs for public-safe summary." : previewText(intent.want, 140),
+    constraints: canViewFull ? intent.constraints : intent.constraints ? "withheld_from_public_listing" : null,
+    raw: canViewFull ? raw : undefined,
+    protected_private_details: !canViewFull
+  };
+}
+
+function publicOffer(offer, actor = {}) {
+  const canViewFull = actor?.signed && isSameAddress(actor.address, offer.actor?.address);
+  const { raw, ...safe } = offer;
+  return {
+    ...safe,
+    proof: canViewFull ? offer.proof : offer.proof ? previewText(offer.proof, 120) : null,
+    terms: canViewFull ? offer.terms : offer.terms ? "terms_withheld_until_proposal_or_order" : null,
+    raw: canViewFull ? raw : undefined,
+    protected_private_details: !canViewFull
+  };
+}
+
+function publicRequest(request, actor = {}) {
+  const canViewFull = actor?.signed && isSameAddress(actor.address, request.actor?.address);
+  return {
+    id: request.id,
+    at: request.at,
+    method: request.method,
+    path: request.path,
+    actor: request.actor,
+    body: canViewFull ? request.body : request.body && Object.keys(request.body).length ? "withheld_from_public_activity" : {},
+    headers: canViewFull ? request.headers : {
+      "user-agent": request.headers?.["user-agent"],
+      "x-agent-id": request.headers?.["x-agent-id"]
+    },
+    protected_private_details: !canViewFull
+  };
+}
+
 function publicBrief(db, brief, actor) {
   const canViewFull = actor?.signed && isSameAddress(actor.address, brief.actor?.address);
   const sample_risk = brief.sample_risk || briefSampleRisk(brief.raw || brief);
   const privacy = brief.privacy_assessment || briefPrivacyAssessment(brief.raw || brief);
+  const canShowStoryPreview = canViewFull || !privacy.protected_private_details;
   return {
     ...brief,
-    story: canViewFull ? brief.story : previewText(brief.story, 260),
+    story: canShowStoryPreview ? canViewFull ? brief.story : previewText(brief.story, 180) : "Private memoir brief; full story is visible only to the signed buyer.",
     raw: canViewFull ? brief.raw : undefined,
     funding_state: briefFundingState(db, brief),
     sample_risk,
@@ -1125,7 +1185,7 @@ function publicOrder(order, actor) {
   const canViewFull = actorCanViewOrderPrivate(order, actor);
   return {
     ...order,
-    deliverable: canViewFull ? order.deliverable : previewText(order.deliverable, 220),
+    deliverable: canViewFull ? order.deliverable : "Memoir deliverable withheld from public listing.",
     raw: canViewFull ? order.raw : undefined,
     linked_private_thread: Boolean(order.proposal_id),
     protected_private_details: !canViewFull,
@@ -1182,7 +1242,7 @@ function publicDelivery(db, delivery, order, actor) {
     actor: delivery.actor,
     order_id: delivery.order_id,
     content_hash: delivery.content_hash,
-    excerpt: canViewFull ? delivery.excerpt : previewText(delivery.excerpt, 280),
+    excerpt: canViewFull ? delivery.excerpt : "Delivery excerpt withheld from public listing; rights-cleared reader previews must be listed through /publications.",
     revised_from_revision_id: delivery.revised_from_revision_id || null,
     supersedes_delivery_id: delivery.supersedes_delivery_id || null,
     status: delivery.status,
@@ -1315,6 +1375,7 @@ function publicationRightsDecision(db, body, actor) {
   const order = db.orders.find((candidate) => candidate.id === body.order_id);
   const delivery = verifiedWriterDeliveryForOrder(db, order, body.delivery_id);
   const released = releasedEscrowForOrder(db, order);
+  const qualityEvidence = delivery ? deliveryQualityEvidence(delivery) : null;
   const rightsText = [
     body.rights_scope,
     body.reader_license_terms,
@@ -1330,6 +1391,7 @@ function publicationRightsDecision(db, body, actor) {
     ...(!delivery ? ["missing_verified_writer_delivery"] : []),
     ...(!actorIsBuyer(order, actor) ? ["actor_not_verified_buyer_or_rights_holder"] : []),
     ...(!released ? ["missing_released_escrow"] : []),
+    ...(qualityEvidence?.status === "memoir_quality_evidence_present" ? [] : ["missing_memoir_quality_evidence"]),
     ...(body.buyer_consent === true || body.rights_holder_consent === true ? [] : ["missing_buyer_rights_holder_consent"]),
     ...(body.writer_consent === true ? [] : ["missing_writer_consent"]),
     ...(/reader|read.access|ebook|publish|publicat|resale|sell/.test(rightsText) ? [] : ["rights_scope_does_not_allow_reader_sales"]),
@@ -1342,6 +1404,7 @@ function publicationRightsDecision(db, body, actor) {
     order,
     delivery,
     released,
+    quality_evidence: qualityEvidence,
     price,
     preview_words: previewWords
   };
@@ -1351,9 +1414,30 @@ function publicPreviewForPublication(delivery, body) {
   return previewText(body.public_preview || body.preview || delivery?.excerpt || "", 720);
 }
 
+function readerReviewLeakRisk(message) {
+  const text = String(message || "");
+  const lower = text.toLowerCase();
+  const flags = [];
+  const quoteMatches = text.match(/["“”'‘’][^"“”'‘’]{60,}["“”'‘’]/g) || [];
+  const longParagraphs = text.split(/\n{2,}/).filter((part) => wordCount(part) > 80);
+  if (quoteMatches.length) flags.push("long_quoted_passage");
+  if (longParagraphs.length) flags.push("review_contains_long_passage");
+  if (/chapter excerpt|opening scene|full paragraph|verbatim|quoted passage|copy from the memoir|line from the draft/.test(lower)) {
+    flags.push("self_identifies_reusable_memoir_text");
+  }
+  return {
+    flags: [...new Set(flags)],
+    public_safe: flags.length === 0,
+    policy: flags.length
+      ? "Review recorded for the paid reader and rights holder, but public proof is blocked until it is rewritten without quoted or reusable memoir passages."
+      : "Review can be public proof because it does not appear to quote reusable memoir material."
+  };
+}
+
 function publicPublication(db, publication, actor = {}) {
   const order = db.orders.find((candidate) => candidate.id === publication.order_id);
   const delivery = db.deliveries.find((candidate) => candidate.id === publication.delivery_id);
+  const released = releasedEscrowForOrder(db, order);
   const readerHasAccess = verifiedReaderPurchaseForPublication(db, publication, actor);
   const canViewFull = Boolean(readerHasAccess || actorCanViewOrderPrivate(order, actor));
   return {
@@ -1377,13 +1461,14 @@ function publicPublication(db, publication, actor = {}) {
     consent: {
       buyer_consent: publication.buyer_consent,
       writer_consent: publication.writer_consent,
-      rights_verified_after_release: publication.rights_verified_after_release
+      rights_verified_after_release: Boolean(released)
     },
     craft_evidence: delivery ? {
       memoir_quality_status: deliveryQualityEvidence(delivery).status,
       content_hash: delivery.content_hash || null
     } : null,
     paid_reader_reviews: db.reader_reviews.filter((review) => review.publication_id === publication.id && review.status === "verified_reader_review").length,
+    protected_reader_reviews: db.reader_reviews.filter((review) => review.publication_id === publication.id && review.status === "verified_reader_review_private_quote_blocked").length,
     paid_reader_purchases: db.reader_purchases.filter((purchase) => purchase.publication_id === publication.id && purchase.status === "verified_paid_read_access").length,
     full_text: canViewFull ? delivery?.draft || delivery?.excerpt || null : undefined,
     read_access: canViewFull ? "verified_access_or_owner" : "purchase_required",
@@ -1453,10 +1538,18 @@ function publicReaderReview(db, review, actor = {}) {
     publication_id: review.publication_id,
     reader_purchase_id: review.reader_purchase_id,
     rating: review.rating,
-    message: canViewFull ? review.message : review.status === "verified_reader_review" ? previewText(review.message, 180) : "Unverified reader review wording withheld.",
+    message: canViewFull
+      ? review.message
+      : review.status === "verified_reader_review"
+        ? previewText(review.message, 180)
+        : review.status === "verified_reader_review_private_quote_blocked"
+          ? "Verified paid reader review recorded, but public wording is withheld because it may quote reusable memoir material."
+          : "Unverified reader review wording withheld.",
     would_buy_more: review.would_buy_more,
     status: review.status,
     verified_paid_read_access: purchase?.status === "verified_paid_read_access",
+    counts_as_public_reader_proof: review.status === "verified_reader_review",
+    leak_risk: review.leak_risk || readerReviewLeakRisk(review.message),
     protected_private_details: !canViewFull,
     public_text_policy: "Reviews are post-purchase only and should not quote reusable memoir passages."
   };
@@ -1611,7 +1704,7 @@ async function handle(req, res) {
   if (req.method === "GET" && url.pathname === "/intents") {
     writeDb(db);
     return send(res, 200, {
-      intents: db.intents,
+      intents: db.intents.map((intent) => publicIntent(intent, actor)),
       ui: ui("Customer demand", "Post /intents if your job is missing.")
     });
   }
@@ -1678,7 +1771,7 @@ async function handle(req, res) {
         .map((delivery) => publicDelivery(db, delivery, order, actor)),
       revisions: db.revisions.filter((item) => item.order_id === orderId).map((revision) => publicRevision(db, revision, actor)),
       revision_comparisons: revisionComparisonPackets(db, order, actor),
-      disputes: db.disputes.filter((item) => item.order_id === orderId),
+      disputes: db.disputes.filter((item) => item.order_id === orderId).map((item) => publicOrderArtifact(db, item, actor)),
       acceptances: db.acceptances.filter((item) => item.order_id === orderId).map((item) => publicOrderArtifact(db, item, actor)),
       refunds: db.refunds.filter((item) => item.order_id === orderId).map((item) => publicOrderArtifact(db, item, actor)),
       releases: db.releases.filter((item) => item.order_id === orderId).map((item) => publicOrderArtifact(db, item, actor)),
@@ -2035,7 +2128,7 @@ async function handle(req, res) {
   if (req.method === "GET" && url.pathname === "/offers") {
     writeDb(db);
     return send(res, 200, {
-      offers: db.offers,
+      offers: db.offers.map((offer) => publicOffer(offer, actor)),
       ui: ui("Available supply", "Post /offers if you can satisfy an open intent.")
     });
   }
@@ -2365,7 +2458,7 @@ async function handle(req, res) {
 
   if (req.method === "GET" && url.pathname === "/disputes") {
     writeDb(db);
-    return send(res, 200, { disputes: db.disputes, ui: ui("Disputes", "Open refund or quality concerns.") });
+    return send(res, 200, { disputes: db.disputes.map((item) => publicOrderArtifact(db, item, actor)), ui: ui("Disputes", "Open refund or quality concerns.") });
   }
 
   if (req.method === "POST" && url.pathname === "/acceptances") {
@@ -2709,6 +2802,7 @@ async function handle(req, res) {
       actor.signed &&
       isSameAddress(actor.address, purchase.actor?.address)
     );
+    const leakRisk = readerReviewLeakRisk(body.message || "");
     const item = {
       id: id("readreview"),
       at: new Date().toISOString(),
@@ -2718,17 +2812,28 @@ async function handle(req, res) {
       rating: body.rating || null,
       message: body.message || "",
       would_buy_more: body.would_buy_more ?? null,
+      leak_risk: leakRisk,
       raw: body,
-      status: verified ? "verified_reader_review" : "unverified_reader_review"
+      status: verified
+        ? leakRisk.public_safe ? "verified_reader_review" : "verified_reader_review_private_quote_blocked"
+        : "unverified_reader_review"
     };
     db.reader_reviews.push(item);
     writeDb(db);
     return send(res, 201, {
-      ok: verified,
+      ok: verified && leakRisk.public_safe,
       reader_review: publicReaderReview(db, item, actor),
       ui: ui(
-        verified ? "Reader review verified" : "Reader review not verified",
-        verified ? "This review counts because it follows verified paid read access." : "Reader reviews require the same signed reader wallet that made verified paid read access."
+        verified && leakRisk.public_safe
+          ? "Reader review verified"
+          : verified
+            ? "Reader review protected"
+            : "Reader review not verified",
+        verified && leakRisk.public_safe
+          ? "This review counts because it follows verified paid read access and does not expose reusable memoir text."
+          : verified
+            ? leakRisk.policy
+            : "Reader reviews require the same signed reader wallet that made verified paid read access."
       )
     });
   }
@@ -2744,9 +2849,10 @@ async function handle(req, res) {
       reader_reviews: reviews.map((review) => publicReaderReview(db, review, actor)),
       summary: {
         total_reader_reviews: reviews.length,
-        verified_reader_reviews: reviews.filter((review) => review.status === "verified_reader_review").length
+        verified_reader_reviews: reviews.filter((review) => review.status === "verified_reader_review").length,
+        protected_paid_reader_reviews: reviews.filter((review) => review.status === "verified_reader_review_private_quote_blocked").length
       },
-      ui: ui("Reader reviews", "Only post-purchase reader reviews count as reader-facing proof.")
+      ui: ui("Reader reviews", "Only post-purchase reader reviews that avoid reusable memoir passages count as public reader-facing proof.")
     });
   }
 
@@ -2834,7 +2940,7 @@ async function handle(req, res) {
   if (req.method === "GET" && url.pathname === "/activity") {
     writeDb(db);
     return send(res, 200, {
-      ...publicActivity(db),
+      ...publicActivity(db, actor),
       conversions: db.conversions,
       ui: ui("Learning log", "Use this to decide what to build next.")
     });
