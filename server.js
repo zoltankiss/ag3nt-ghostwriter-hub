@@ -1257,7 +1257,26 @@ function publisherBuyerBriefSignal(body = {}) {
   };
 }
 
-function publicPublisherHandoff(handoff) {
+function publicHandoffCheckoutSummary(db, handoff, actor = {}) {
+  if (!db || !handoff) return null;
+  const checkout = publisherCheckoutForHandoff(db, handoff, actor);
+  return {
+    checkout_status: checkout.checkout_status,
+    selected_order_id: checkout.selected_order_id,
+    linked_order_count: checkout.linked_order_count,
+    downstream_conversion_state: checkout.downstream.downstream_conversion_state,
+    verified_funded_order_count: checkout.downstream.verified_funded_order_count,
+    accepted_delivery_count: checkout.downstream.accepted_delivery_count,
+    released_paid_order_count: checkout.downstream.released_paid_order_count,
+    counts_as_conversion: checkout.gates.counts_as_conversion,
+    next_action: checkout.next_action,
+    audit_path: `/publisher-checkouts?handoff_id=${handoff.id}`,
+    protected_private_details: true
+  };
+}
+
+function publicPublisherHandoff(handoff, options = {}) {
+  const checkout = options.db ? publicHandoffCheckoutSummary(options.db, handoff, options.actor || {}) : null;
   return {
     id: handoff.id,
     at: handoff.at,
@@ -1268,6 +1287,7 @@ function publicPublisherHandoff(handoff) {
     created_brief_id: handoff.created_brief_id || null,
     linked_proposal_id: handoff.linked_proposal_id || null,
     diagnostic_checkout: handoff.diagnostic_checkout || null,
+    checkout,
     public_context_summary: handoff.public_context_summary,
     tags: handoff.tags,
     publisher_signal_requirements: handoff.publisher_signal_requirements || null,
@@ -1616,6 +1636,7 @@ function publisherCheckoutForHandoff(db, handoff, actor = {}) {
   const linkedOrders = handoffLinkedOrders(db, handoff);
   const selectedOrder = linkedOrders.slice().reverse().find((order) => verifiedEscrowForOrder(db, order)) || linkedOrders.at(-1) || null;
   const trust = selectedOrder ? orderTrustState(db, selectedOrder) : null;
+  const hasCheckoutDraft = Boolean(handoff.diagnostic_checkout);
   const hasOrder = Boolean(selectedOrder);
   const hasVerifiedEscrow = Boolean(trust?.verified_escrow);
   const hasAcknowledgement = Boolean(trust?.latest_writer_acknowledgement);
@@ -1640,10 +1661,16 @@ function publisherCheckoutForHandoff(db, handoff, actor = {}) {
                 : hasOrder
                   ? "order_started_awaiting_verified_escrow"
                   : handoff.status === "workflow_started"
-                    ? "checkout_draft_no_order"
+                    ? hasCheckoutDraft
+                      ? "checkout_draft_no_order"
+                      : "workflow_started_needs_private_proposal_checkout"
                     : "feedback_only_no_checkout";
   const missingNext = [
-    hasOrder ? null : "buyer_post_order_from_diagnostic_checkout",
+    hasOrder
+      ? null
+      : hasCheckoutDraft
+        ? "buyer_post_order_from_diagnostic_checkout"
+        : "publisher_route_private_proposal_before_checkout",
     hasVerifiedEscrow ? null : "buyer_attach_verified_numeric_chain_escrow_with_order_id_ref",
     hasAcknowledgement || !hasVerifiedEscrow ? null : "signed_writer_acknowledge_funded_order",
     hasDelivery || !hasVerifiedEscrow ? null : "writer_submit_funded_delivery",
@@ -1765,6 +1792,7 @@ function publisherCheckoutAudit(db, actor = {}, filters = {}) {
 
 function publicHandoffQualityExample(db, handoff) {
   const downstream = handoffLinkedDownstreamState(db, handoff);
+  const checkout = publicHandoffCheckoutSummary(db, handoff);
   return {
     id: handoff.id,
     at: handoff.at,
@@ -1783,6 +1811,7 @@ function publicHandoffQualityExample(db, handoff) {
       buyer_signal_ok: handoff.publisher_signal_requirements?.buyer_brief?.ok ?? null
     },
     downstream,
+    checkout,
     protected_private_details: true
   };
 }
@@ -1806,6 +1835,7 @@ function publisherHandoffQuality(db) {
     (handoff.blocked_reasons || []).some((reason) => reason.startsWith("missing_") && reason.endsWith("_ack"))
   );
   const downstreamStates = handoffs.map((handoff) => handoffLinkedDownstreamState(db, handoff));
+  const checkoutSummaries = handoffs.map((handoff) => publicHandoffCheckoutSummary(db, handoff));
   const fundedFromHandoffs = downstreamStates.filter((state) => state.verified_funded_order_count > 0);
   const acceptedFromHandoffs = downstreamStates.filter((state) => state.accepted_delivery_count > 0);
   const releasedFromHandoffs = downstreamStates.filter((state) => state.released_paid_order_count > 0);
@@ -1814,6 +1844,10 @@ function publisherHandoffQuality(db) {
     reason,
     count: reasons.filter((candidate) => candidate === reason).length
   })).sort((a, b) => b.count - a.count || a.reason.localeCompare(b.reason));
+  const checkoutStatusCounts = [...new Set(checkoutSummaries.map((summary) => summary.checkout_status))].map((status) => ({
+    status,
+    count: checkoutSummaries.filter((summary) => summary.checkout_status === status).length
+  })).sort((a, b) => b.count - a.count || a.status.localeCompare(b.status));
   const qualityStatus =
     !handoffs.length
       ? "no_native_handoff_data_yet"
@@ -1843,6 +1877,12 @@ function publisherHandoffQuality(db) {
       linked_funded_value: downstreamStates.reduce((sum, state) => sum + state.funded_value, 0)
     },
     reason_counts: reasonCounts,
+    checkout_status_counts: checkoutStatusCounts,
+    checkout_audit: {
+      path: "http://localhost:4501/publisher-checkouts",
+      purpose: "Use this before reporting publisher performance; checkout drafts and awaiting-escrow orders are not conversion evidence.",
+      conversion_statuses: ["verified_funded_awaiting_writer_acknowledgement", "writer_acknowledged_awaiting_delivery", "delivered_awaiting_acceptance", "accepted_pending_release", "released_paid_work"]
+    },
     publisher_action: {
       ag3ntbook: started.length
         ? "Keep routing only public memoir-service buyer/writer actions with full service-term acknowledgement; add verified escrow before showing success."
@@ -5943,7 +5983,7 @@ async function handle(req, res) {
     writeDb(db);
     return send(res, result.handoff.status === "workflow_started" ? 201 : 202, {
       ok: result.handoff.status === "workflow_started",
-      handoff: publicPublisherHandoff(result.handoff),
+      handoff: publicPublisherHandoff(result.handoff, { db, actor }),
       created_brief: result.createdBrief ? publicBrief(db, result.createdBrief, actor) : null,
       created_proposal: result.createdProposal ? publicProposal(db, result.createdProposal, actor) : null,
       diagnostic_checkout: result.handoff.diagnostic_checkout || null,
@@ -5963,15 +6003,23 @@ async function handle(req, res) {
     const roleFilter = url.searchParams.get("role");
     if (statusFilter) handoffs = handoffs.filter((handoff) => handoff.status === statusFilter);
     if (roleFilter) handoffs = handoffs.filter((handoff) => handoff.role === roleFilter);
+    const checkoutSummaries = handoffs.map((handoff) => publicHandoffCheckoutSummary(db, handoff, actor));
+    const checkoutStatusCounts = [...new Set(checkoutSummaries.map((summary) => summary.checkout_status))].map((status) => ({
+      status,
+      count: checkoutSummaries.filter((summary) => summary.checkout_status === status).length
+    })).sort((a, b) => b.count - a.count || a.status.localeCompare(b.status));
     writeDb(db);
     return send(res, 200, {
-      publisher_handoffs: handoffs.slice().reverse().map(publicPublisherHandoff),
+      publisher_handoffs: handoffs.slice().reverse().map((handoff) => publicPublisherHandoff(handoff, { db, actor })),
       counts: {
         total: handoffs.length,
         workflow_started: handoffs.filter((handoff) => handoff.status === "workflow_started").length,
         blocked_or_feedback_only: handoffs.filter((handoff) => handoff.status === "not_pmf").length,
-        buyer_briefs_created: handoffs.filter((handoff) => handoff.created_brief_id).length
+        buyer_briefs_created: handoffs.filter((handoff) => handoff.created_brief_id).length,
+        conversion_eligible_handoffs: checkoutSummaries.filter((summary) => summary.counts_as_conversion).length
       },
+      checkout_status_counts: checkoutStatusCounts,
+      checkout_audit_path: "/publisher-checkouts",
       filters: {
         status: statusFilter || null,
         role: roleFilter || null,
